@@ -1,0 +1,2 @@
+tests/fixtures/workspace/widgets/Cargo.toml -text
+*.sh text eol=lf

@@ -1,0 +1,115 @@
+<!doctype html>
+<!-- MOCKUP: HTML reproduction of the BuildGUI.bat window using the rtk v1.0.1
+     tokens from lib/RtkTheme.ps1. It is NOT a screenshot of the real WinForms
+     window, which has not been run on Windows yet. -->
+<html><head><meta charset="utf-8"><title>Rust Click Build GUI (mockup)</title>
+<style>
+@font-face { font-family: 'Noto Sans'; src: url('../assets/fonts/NotoSans-Regular.ttf'); font-weight: 400; }
+@font-face { font-family: 'Noto Sans'; src: url('../assets/fonts/NotoSans-Bold.ttf'); font-weight: 700; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #6b7280; font-family: 'Noto Sans', sans-serif; font-size: 14px; }
+.banner { background: #fde047; color: #111; border: 3px solid #111; font-weight: 700; font-size: 22px; padding: 12px 18px; margin-bottom: 20px; text-align: center; letter-spacing: .3px; }
+.banner small { display: block; font-weight: 400; font-size: 14px; margin-top: 4px; }
+.row { display: flex; gap: 24px; align-items: flex-start; }
+.cap { color: #fff; font-weight: 700; margin: 0 0 8px 2px; }
+.win { width: 860px; border: 1px solid #000; box-shadow: 0 8px 30px rgba(0,0,0,.35); }
+.tb { height: 32px; display: flex; align-items: center; padding: 0 12px; font-size: 12px; font-family: 'Segoe UI', 'Noto Sans', sans-serif; }
+.tb .ctl { margin-left: auto; letter-spacing: 22px; }
+.client { height: 720px; display: flex; flex-direction: column; position: relative; }
+.hdr { height: 68px; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--surface); position: relative; }
+.title { font-size: 18px; font-weight: 700; color: var(--fg); line-height: 26px; }
+.sub { font-size: 12px; color: var(--muted); }
+.theme { position: absolute; right: 22px; top: 18px; display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+.combo { width: 160px; height: 30px; border: 1px solid var(--border); background: var(--field); color: var(--fg); font-size: 14px; padding: 4px 10px; display: flex; justify-content: space-between; }
+.body { flex: 1; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--bg); }
+.card { background: var(--surface); border: var(--bw) solid var(--border); border-radius: var(--card); padding: 14px 16px 16px; }
+.lab { font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 8px; letter-spacing: .4px; }
+.line { display: flex; gap: 8px; align-items: center; }
+.entry { flex: 1; height: 38px; border: var(--bw) solid var(--border); border-radius: var(--sm); background: var(--field); color: var(--fg); padding: 8px 12px; }
+.btn { height: 38px; border: var(--bw) solid var(--border); border-radius: var(--md); background: var(--surface); color: var(--fg); padding: 8px 14px; min-width: 110px; text-align: center; }
+.btn.hover { background: var(--hover); }
+.accent { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 700; min-width: 150px; height: 42px; padding-top: 10px; margin-left: auto; }
+.opts { display: flex; gap: 22px; color: var(--fg); margin-bottom: 8px; }
+.ck { display: inline-flex; gap: 8px; align-items: center; }
+.box { width: 14px; height: 14px; border: 1px solid var(--border); background: var(--field); display: inline-block; }
+.box.on { background: var(--accent); border-color: var(--accent); }
+.radio { border-radius: 50%; }
+.radio.on { box-shadow: inset 0 0 0 3px var(--field); }
+.log { flex: 1; display: flex; flex-direction: column; }
+.logbox { flex: 1; background: var(--bg); color: var(--fg); font-family: Consolas, 'DejaVu Sans Mono', monospace; font-size: 13px; line-height: 18px; padding: 8px 10px; white-space: pre; overflow: hidden; }
+.status { height: 34px; border-top: 1px solid var(--border); background: var(--surface); color: var(--success); font-size: 12px; padding: 9px 24px; }
+.a { color: var(--accent); } .s { color: var(--success); } .w { color: var(--warning); } .d { color: var(--danger); } .m { color: var(--muted); } .b { font-weight: 700; }
+.stamp { position: absolute; right: 18px; bottom: 44px; transform: rotate(-8deg); border: 3px solid #e11d48; color: #e11d48; font-weight: 700; font-size: 20px; padding: 4px 10px; background: rgba(255,255,255,.85); }
+.dark { --bg:#0F1115; --surface:#171A21; --field:#171A21; --fg:#E6E8EE; --muted:#9AA3B2; --accent:#4F8CFF; --accent-fg:#0F1115; --border:#2A3040; --hover:#23262D; --success:#4ADE80; --warning:#FBBF24; --danger:#F87171; --bw:1px; --card:12px; --sm:6px; --md:10px; }
+.light { --bg:#F5F7FB; --surface:#FFFFFF; --field:#FFFFFF; --fg:#1B1F2A; --muted:#5A6476; --accent:#2563EB; --accent-fg:#FFFFFF; --border:#E2E6EF; --hover:#F0F1F2; --success:#15803D; --warning:#B45309; --danger:#B91C1C; --bw:1px; --card:12px; --sm:6px; --md:10px; }
+.dark .tb { background:#202020; color:#fff; } .light .tb { background:#fff; color:#000; border-bottom: 1px solid #ddd; }
+</style></head><body>
+<div class="banner">MOCKUP &mdash; HTML reproduction of BuildGUI, NOT a real Windows render
+<small>Built from the rtk v1.0.1 tokens in lib/RtkTheme.ps1 (Noto Sans 14px, ModernDark / ModernLight). The WinForms GUI has not been run on Windows yet.</small></div>
+<div class="row">
+<div><div class="cap">Dark (ModernDark)</div><div class="win dark">
+<div class="tb">Rust Click Build<span class="ctl">&#8212; &#9744; &#10005;</span></div>
+<div class="client">
+ <div class="hdr"><div class="title">Rust Click Build</div><div class="sub">Click-and-go cargo builder &nbsp;|&nbsp; rtk style</div>
+  <div class="theme">Theme <div class="combo">Dark<span>&#9662;</span></div></div></div>
+ <div class="body">
+  <div class="card"><div class="lab">PROJECT FOLDER</div>
+   <div class="line"><div class="entry">C:\Users\tyler\code\my-rtk-app</div><div class="btn hover">Browse...</div></div></div>
+  <div class="card"><div class="lab">BUILD OPTIONS</div>
+   <div class="line"><div>
+    <div class="opts"><span class="ck"><span class="box radio on"></span>Release</span><span class="ck"><span class="box radio"></span>Debug</span><span class="ck"><span class="box"></span>Run tests (cargo test)</span></div>
+    <div class="opts"><span class="ck"><span class="box on"></span>Check for rtk updates before building (recommended)</span></div>
+   </div><div class="btn accent">Start Build</div></div></div>
+  <div class="card log"><div class="lab">BUILD LOG</div><div class="logbox"><span class="a">==========================================================
+ Rust Project Builder: C:\Users\tyler\code\my-rtk-app</span>
+<span class="s">Discovered 1 project(s)/workspace(s).</span>
+<span class="a">[1/1] Building project 'my-rtk-app'...</span>
+<span class="a">  rtk: latest release is v1.0.1 (via git ls-remote)</span>
+<span class="m">  rtk: backed up Cargo.toml/Cargo.lock to _built\rtk-backup-...</span>
+<span class="a b">  rtk: UPDATE </span><span class="w b">v0.8.2</span><span class="m"> -&gt; </span><span class="s b">v1.0.1</span><span class="m">  (my-rtk-app/Cargo.toml [dependencies])</span>
+<span class="s">  rtk: cargo update -p rtk done.</span>
+<span class="m">     Compiling rtk v1.0.1
+     Compiling my-rtk-app v0.1.0
+      Finished `release` profile [optimized]</span>
+<span class="s">[1/1] PASS: 'my-rtk-app' built in 41.2s (1 binary artifacts copied).</span>
+<span class="a">============================= SUMMARY =============================</span>
+<span class="b">Project    BuildStatus TestStatus Artifacts Seconds Rtk</span>
+<span class="m">-------    ----------- ---------- --------- ------- ---</span>
+<span class="s">my-rtk-app PASS        N/A                1    41.2 </span><span class="w b">v0.8.2</span><span class="m"> -&gt; </span><span class="s b">v1.0.1</span></div></div>
+ </div>
+ <div class="status">Done: 1 built, 0 failed.  rtk: my-rtk-app: v0.8.2 -&gt; v1.0.1</div>
+ <div class="stamp">MOCKUP</div>
+</div></div></div><div><div class="cap">Light (ModernLight)</div><div class="win light">
+<div class="tb">Rust Click Build<span class="ctl">&#8212; &#9744; &#10005;</span></div>
+<div class="client">
+ <div class="hdr"><div class="title">Rust Click Build</div><div class="sub">Click-and-go cargo builder &nbsp;|&nbsp; rtk style</div>
+  <div class="theme">Theme <div class="combo">Light<span>&#9662;</span></div></div></div>
+ <div class="body">
+  <div class="card"><div class="lab">PROJECT FOLDER</div>
+   <div class="line"><div class="entry">C:\Users\tyler\code\my-rtk-app</div><div class="btn">Browse...</div></div></div>
+  <div class="card"><div class="lab">BUILD OPTIONS</div>
+   <div class="line"><div>
+    <div class="opts"><span class="ck"><span class="box radio on"></span>Release</span><span class="ck"><span class="box radio"></span>Debug</span><span class="ck"><span class="box"></span>Run tests (cargo test)</span></div>
+    <div class="opts"><span class="ck"><span class="box on"></span>Check for rtk updates before building (recommended)</span></div>
+   </div><div class="btn accent">Start Build</div></div></div>
+  <div class="card log"><div class="lab">BUILD LOG</div><div class="logbox"><span class="a">==========================================================
+ Rust Project Builder: C:\Users\tyler\code\my-rtk-app</span>
+<span class="s">Discovered 1 project(s)/workspace(s).</span>
+<span class="a">[1/1] Building project 'my-rtk-app'...</span>
+<span class="a">  rtk: latest release is v1.0.1 (via git ls-remote)</span>
+<span class="m">  rtk: backed up Cargo.toml/Cargo.lock to _built\rtk-backup-...</span>
+<span class="a b">  rtk: UPDATE </span><span class="w b">v0.8.2</span><span class="m"> -&gt; </span><span class="s b">v1.0.1</span><span class="m">  (my-rtk-app/Cargo.toml [dependencies])</span>
+<span class="s">  rtk: cargo update -p rtk done.</span>
+<span class="m">     Compiling rtk v1.0.1
+     Compiling my-rtk-app v0.1.0
+      Finished `release` profile [optimized]</span>
+<span class="s">[1/1] PASS: 'my-rtk-app' built in 41.2s (1 binary artifacts copied).</span>
+<span class="a">============================= SUMMARY =============================</span>
+<span class="b">Project    BuildStatus TestStatus Artifacts Seconds Rtk</span>
+<span class="m">-------    ----------- ---------- --------- ------- ---</span>
+<span class="s">my-rtk-app PASS        N/A                1    41.2 </span><span class="w b">v0.8.2</span><span class="m"> -&gt; </span><span class="s b">v1.0.1</span></div></div>
+ </div>
+ <div class="status">Done: 1 built, 0 failed.  rtk: my-rtk-app: v0.8.2 -&gt; v1.0.1</div>
+ <div class="stamp">MOCKUP</div>
+</div></div></div>
+</div></body></html>

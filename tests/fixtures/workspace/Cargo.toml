@@ -1,0 +1,6 @@
+[workspace]
+members = ["app", "widgets"]
+resolver = "2"
+
+[workspace.dependencies]
+rtk = { git = "https://github.com/ubcool2ic/rtk", tag = "v1.0.0" }

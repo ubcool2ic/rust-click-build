@@ -1,0 +1,9 @@
+[package]
+name = "no-rtk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"
+# rtk = { git = "https://github.com/ubcool2ic/rtk", tag = "v0.1.0" }
+rtk-like = { git = "https://github.com/someone-else/rtk", tag = "v0.1.0" }

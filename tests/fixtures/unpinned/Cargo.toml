@@ -1,0 +1,7 @@
+[package]
+name = "unpinned"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rtk = { git = "https://github.com/ubcool2ic/rtk.git" }
