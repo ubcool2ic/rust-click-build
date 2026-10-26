@@ -1,0 +1,12 @@
+[package]
+name = "widgets"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies.ui]
+package = "rtk"
+git = "git@github.com:ubcool2ic/rtk.git"
+tag = "v0.8.2"
+
+[target.'cfg(windows)'.dependencies]
+rtk-extra = { package = "rtk", git = "https://github.com/ubcool2ic/rtk", branch = "main" }
