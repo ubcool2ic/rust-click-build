@@ -50,6 +50,10 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+On Linux and macOS the end-to-end test runs the real `build.ps1` and fails if
+`pwsh` is not on PATH. Set `RCB_SKIP_E2E=1` to skip it on purpose; it then
+prints `SKIPPED`. The tests use only rtk's public API.
+
 ## Protocol
 
 `build.ps1 -JsonProgress` writes one event per stdout line: `@@RCB ` followed

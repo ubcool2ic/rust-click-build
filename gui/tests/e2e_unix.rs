@@ -55,16 +55,21 @@ fn make_args(script: &Path, projects: &Path, theme: ThemeChoice) -> Args {
     parsed
 }
 
+/// Presses a button through rtk's public accessibility action (the same
+/// path a screen reader uses); fails if the button is disabled.
 fn click(tk: &mut Tk, id: WidgetId) {
-    let rect = tk.widget_rect(id).expect("widget is laid out");
-    tk.sim_click(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    assert!(
+        tk.a11y_do_action(id, rtk::A11yAction::Click, None),
+        "button is disabled or not clickable"
+    );
 }
 
 /// Sets the app up, records every runner message and clicks "Start build".
 fn launch(parsed: &Args) -> (Tk, UiHandles, Rc<RefCell<Vec<String>>>) {
     let mut tk = Tk::new();
     app::setup(&mut tk, parsed).expect("setup");
-    tk.sim_resize(WINDOW_WIDTH, WINDOW_HEIGHT);
+    tk.render_to_pixmap(WINDOW_WIDTH, WINDOW_HEIGHT)
+        .expect("layout render");
     let transcript = Rc::new(RefCell::new(Vec::new()));
     let store = Rc::clone(&transcript);
     app::set_message_tap(Some(Box::new(move |msg| {
@@ -117,9 +122,14 @@ fn save(tk: &mut Tk, shots: Option<&PathBuf>, name: &str) {
 
 #[test]
 fn real_build_script_through_the_gui() {
+    // A green run must mean the real build.ps1 ran: fail loudly without pwsh
+    // unless the skip is explicitly requested.
     if !on_path("pwsh") {
-        eprintln!("skipping e2e test: `pwsh` is not on PATH");
-        return;
+        if std::env::var_os("RCB_SKIP_E2E").is_some() {
+            eprintln!("SKIPPED e2e test: `pwsh` is not on PATH and RCB_SKIP_E2E is set");
+            return;
+        }
+        panic!("e2e test needs `pwsh` on PATH (set RCB_SKIP_E2E=1 to skip it explicitly)");
     }
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let script = repo.join("build.ps1");

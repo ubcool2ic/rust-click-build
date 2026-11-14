@@ -129,7 +129,6 @@ fn render_one(choice: ThemeChoice, stage: Stage, path: &Path) -> Result<usize, B
     tk.entry_set(ui.folder_entry, "C:\\Users\\dev\\projects\\rust-apps");
     ui.test_var.set(&mut tk, true);
     let state = sample_state(stage);
-    tk.sim_resize(WINDOW_WIDTH, WINDOW_HEIGHT);
     ui::render(&mut tk, &ui, &state);
     let pixmap = tk.render_to_pixmap(WINDOW_WIDTH, WINDOW_HEIGHT)?;
     let distinct = count_distinct(pixmap.data());

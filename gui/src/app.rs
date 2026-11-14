@@ -627,28 +627,41 @@ mod tests {
         };
         let mut tk = Tk::new();
         setup(&mut tk, &args).expect("setup");
-        tk.sim_resize(WINDOW_WIDTH, WINDOW_HEIGHT);
+        // Lays the window out at its real size (public API).
+        tk.render_to_pixmap(WINDOW_WIDTH, WINDOW_HEIGHT)
+            .expect("layout render");
         let handles = ui_handles().expect("handles");
-        let rect = tk.widget_rect(handles.folder_entry).expect("entry rect");
-        let (x, y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        let centre = |tk: &mut Tk, id: WidgetId| {
+            let rect = tk.widget_rect(id).expect("widget rect");
+            (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+        };
         let entry_text = |tk: &mut Tk| tk.entry_get(handles.folder_entry).unwrap_or_default();
 
-        // A directory dropped on the entry is used as is.
-        tk.sim_file_drop(x, y, std::slice::from_ref(&sub));
+        // The entry and the rest of the window (via the root binding) accept
+        // drops: rtk's public hit test finds a drop target at both points.
+        let (ex, ey) = centre(&mut tk, handles.folder_entry);
+        assert!(
+            tk.drop_target_at(ex, ey).is_some(),
+            "entry is not a drop target",
+        );
+        let (tx, ty) = centre(&mut tk, handles.table);
+        assert!(
+            tk.drop_target_at(tx, ty).is_some(),
+            "window is not a drop target",
+        );
+
+        // rtk's public API has no way to fire a drop, so call the bound
+        // handler directly. A directory is used as is.
+        on_file_drop(&mut tk, std::slice::from_ref(&sub));
         assert_eq!(entry_text(&mut tk).as_str(), sub.to_string_lossy());
 
-        // A file dropped elsewhere on the window selects its parent.
-        let table = tk.widget_rect(handles.table).expect("table rect");
-        tk.sim_file_drop(
-            table.x + table.width / 2.0,
-            table.y + table.height / 2.0,
-            std::slice::from_ref(&file),
-        );
+        // A file selects its parent folder.
+        on_file_drop(&mut tk, std::slice::from_ref(&file));
         assert_eq!(entry_text(&mut tk).as_str(), dir.to_string_lossy());
 
         // Drops are ignored while a build is running.
         with_app(|app| app.state.begin());
-        tk.sim_file_drop(x, y, std::slice::from_ref(&sub));
+        on_file_drop(&mut tk, std::slice::from_ref(&sub));
         assert_eq!(entry_text(&mut tk).as_str(), dir.to_string_lossy());
 
         teardown();
@@ -668,15 +681,14 @@ mod tests {
         };
         let mut tk = Tk::new();
         setup(&mut tk, &args).expect("setup");
-        tk.sim_resize(WINDOW_WIDTH, WINDOW_HEIGHT);
 
         let mock = MockFileDialog::new();
         mock.push_response(Some(vec![dir.clone()]));
         tk.file_dialog_set_backend(mock.clone());
 
         let handles = ui_handles().expect("handles");
-        let rect = tk.widget_rect(handles.browse).expect("browse rect");
-        tk.sim_click(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        // Press the real Browse button through rtk's public accessibility action.
+        assert!(tk.a11y_do_action(handles.browse, rtk::A11yAction::Click, None));
         pump(&mut tk);
 
         let text = tk.entry_get(handles.folder_entry).unwrap_or_default();

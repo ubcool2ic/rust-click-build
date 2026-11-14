@@ -714,16 +714,13 @@ mod tests {
 
     #[test]
     fn log_scrollback_stays_where_the_user_scrolled() {
-        /// Wheel amount in whatever numeric type `sim_wheel` takes.
-        fn lines<T: From<i8>>(n: i8) -> T {
-            T::from(n)
-        }
-
         let mut tk = Tk::new();
         tk.geometry(crate::WINDOW_WIDTH, crate::WINDOW_HEIGHT);
         theme::apply(&mut tk, ThemeChoice::Dark);
         let ui = build(&mut tk, ThemeChoice::Dark).expect("ui builds");
-        tk.sim_resize(crate::WINDOW_WIDTH, crate::WINDOW_HEIGHT);
+        // Lays the window out at its real size (public API).
+        tk.render_to_pixmap(crate::WINDOW_WIDTH, crate::WINDOW_HEIGHT)
+            .expect("layout render");
 
         let mut state = BuildState::new();
         state.begin();
@@ -745,19 +742,13 @@ mod tests {
         tk.yview_moveto(ui.log_canvas, 1.0);
         assert!((view_y(&mut tk) - bottom).abs() < 0.5, "not pinned to the bottom");
 
-        // Wheel up over the log (try the other sign if the first is "down").
-        let rect = tk.widget_rect(ui.log_canvas).expect("log canvas rect");
-        tk.sim_mouse_move(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-        for _ in 0..4 {
-            tk.sim_wheel(lines(3));
-        }
-        if view_y(&mut tk) >= bottom - 0.5 {
-            for _ in 0..4 {
-                tk.sim_wheel(lines(-3));
-            }
-        }
+        // Scroll up the way the mouse wheel does (public yview_scroll).
+        tk.yview_scroll(ui.log_canvas, -12, rtk::ScrollUnit::Units);
         let up = view_y(&mut tk);
-        assert!(up < bottom - 0.5, "wheel did not scroll up: {up} vs {bottom}");
+        assert!(
+            up < bottom - 0.5,
+            "scrolling up did not move the view: {up} vs {bottom}",
+        );
 
         // A new line must not drag the view back to the bottom.
         state.push_log(Role::Text, "one more line");
