@@ -1,0 +1,75 @@
+@@RCB {"event":"start","version":1,"path":"C:\\Users\\dev\\projects\\rust-apps","profile":"release","test":true,"rtk_update":true,"log_file":"C:\\Users\\dev\\projects\\rust-apps\\_built\\build-log.txt"}
+@@RCB {"event":"log","text":"Rust Click Build","role":"heading"}
+@@RCB {"event":"log","text":"Scanning C:\\Users\\dev\\projects\\rust-apps for Cargo projects...","role":"muted"}
+@@RCB {"event":"discovered","count":5,"projects":["clock-widget","file-sorter","net-probe","pixel-paint","todo-tray"]}
+@@RCB {"event":"log","text":"Found 5 projects","role":"info"}
+@@RCB {"event":"project_start","index":1,"total":5,"name":"clock-widget","dir":"C:\\Users\\dev\\projects\\rust-apps\\clock-widget"}
+@@RCB {"event":"log","text":"[1/5] clock-widget","role":"heading"}
+@@RCB {"event":"phase","index":1,"name":"clock-widget","phase":"rtk"}
+@@RCB {"event":"rtk","index":1,"name":"clock-widget","status":"v1.0.2","changed":false}
+@@RCB {"event":"phase","index":1,"name":"clock-widget","phase":"build"}
+@@RCB {"event":"log","text":"   Compiling clock-widget v0.3.1","role":"text"}
+@@RCB {"event":"log","text":"    Finished `release` profile [optimized] target(s) in 8.42s","role":"success"}
+@@RCB {"event":"phase","index":1,"name":"clock-widget","phase":"test"}
+@@RCB {"event":"log","text":"test result: ok. 12 passed; 0 failed","role":"success"}
+@@RCB {"event":"phase","index":1,"name":"clock-widget","phase":"collect"}
+@@RCB {"event":"project_end","index":1,"name":"clock-widget","build":"PASS","test":"PASS","artifacts":1,"seconds":11.87,"rtk":"v1.0.2","errors":[],"hints":[]}
+@@RCB {"event":"project_start","index":2,"total":5,"name":"file-sorter","dir":"C:\\Users\\dev\\projects\\rust-apps\\file-sorter"}
+@@RCB {"event":"log","text":"[2/5] file-sorter","role":"heading"}
+@@RCB {"event":"phase","index":2,"name":"file-sorter","phase":"rtk"}
+@@RCB {"event":"rtk","index":2,"name":"file-sorter","status":"not used","changed":false}
+@@RCB {"event":"phase","index":2,"name":"file-sorter","phase":"build"}
+@@RCB {"event":"log","text":"   Compiling file-sorter v1.2.0","role":"text"}
+@@RCB {"event":"log","text":"warning: unused variable: `depth`","role":"warning"}
+@@RCB {"event":"log","text":"    Finished `release` profile [optimized] target(s) in 5.10s","role":"success"}
+@@RCB {"event":"phase","index":2,"name":"file-sorter","phase":"test"}
+@@RCB {"event":"log","text":"test result: ok. 31 passed; 0 failed","role":"success"}
+@@RCB {"event":"phase","index":2,"name":"file-sorter","phase":"collect"}
+@@RCB {"event":"project_end","index":2,"name":"file-sorter","build":"PASS","test":"PASS","artifacts":2,"seconds":7.34,"rtk":"not used","errors":[],"hints":[]}
+@@RCB {"event":"project_start","index":3,"total":5,"name":"net-probe","dir":"C:\\Users\\dev\\projects\\rust-apps\\net-probe"}
+@@RCB {"event":"log","text":"[3/5] net-probe","role":"heading"}
+@@RCB {"event":"phase","index":3,"name":"net-probe","phase":"rtk"}
+@@RCB {"event":"log","text":"rtk v0.8.2 -> v1.0.2 (Cargo.toml updated)","role":"rtkchange"}
+@@RCB {"event":"rtk","index":3,"name":"net-probe","status":"v0.8.2 -> v1.0.2","changed":true}
+@@RCB {"event":"log","text":"   Compiling rtk v1.0.2","role":"text"}
+@@RCB {"event":"phase","index":3,"name":"net-probe","phase":"build"}
+@@RCB {"event":"log","text":"   Compiling net-probe v0.9.4","role":"text"}
+@@RCB {"event":"log","text":"    Finished `release` profile [optimized] target(s) in 41.77s","role":"success"}
+@@RCB {"event":"phase","index":3,"name":"net-probe","phase":"test"}
+@@RCB {"event":"log","text":"test result: ok. 8 passed; 0 failed","role":"success"}
+@@RCB {"event":"phase","index":3,"name":"net-probe","phase":"collect"}
+@@RCB {"event":"project_end","index":3,"name":"net-probe","build":"PASS","test":"PASS","artifacts":1,"seconds":46.02,"rtk":"v0.8.2 -> v1.0.2","errors":[],"hints":[]}
+@@RCB {"event":"project_start","index":4,"total":5,"name":"pixel-paint","dir":"C:\\Users\\dev\\projects\\rust-apps\\pixel-paint"}
+@@RCB {"event":"log","text":"[4/5] pixel-paint","role":"heading"}
+@@RCB {"event":"phase","index":4,"name":"pixel-paint","phase":"rtk"}
+@@RCB {"event":"rtk","index":4,"name":"pixel-paint","status":"v1.0.2","changed":false}
+@@RCB {"event":"phase","index":4,"name":"pixel-paint","phase":"build"}
+@@RCB {"event":"log","text":"   Compiling pixel-paint v0.5.0","role":"text"}
+@@RCB {"event":"log","text":"error[E0425]: cannot find value `canvas_width` in this scope","role":"danger"}
+@@RCB {"event":"log","text":"  --> src\\render.rs:42:18","role":"danger"}
+@@RCB {"event":"log","text":"   |","role":"muted"}
+@@RCB {"event":"log","text":"42 |     let cols = canvas_width / CELL;","role":"text"}
+@@RCB {"event":"log","text":"   |                ^^^^^^^^^^^^ help: a local variable with a similar name exists: `canvas_w`","role":"danger"}
+@@RCB {"event":"log","text":"error: could not compile `pixel-paint` (bin \"pixel-paint\") due to 1 previous error","role":"danger"}
+@@RCB {"event":"project_end","index":4,"name":"pixel-paint","build":"FAIL","test":"N/A","artifacts":0,"seconds":3.91,"rtk":"v1.0.2","errors":["error[E0425]: cannot find value `canvas_width` in this scope","  --> src\\render.rs:42:18"],"hints":["Rename `canvas_width` to `canvas_w` in src\\render.rs line 42."]}
+@@RCB {"event":"project_start","index":5,"total":5,"name":"todo-tray","dir":"C:\\Users\\dev\\projects\\rust-apps\\todo-tray"}
+@@RCB {"event":"log","text":"[5/5] todo-tray","role":"heading"}
+@@RCB {"event":"phase","index":5,"name":"todo-tray","phase":"rtk"}
+@@RCB {"event":"rtk","index":5,"name":"todo-tray","status":"v1.0.2","changed":false}
+@@RCB {"event":"phase","index":5,"name":"todo-tray","phase":"build"}
+@@RCB {"event":"log","text":"   Compiling todo-tray v2.0.1","role":"text"}
+@@RCB {"event":"log","text":"    Finished `release` profile [optimized] target(s) in 9.65s","role":"success"}
+@@RCB {"event":"phase","index":5,"name":"todo-tray","phase":"test"}
+@@RCB {"event":"log","text":"test result: ok. 19 passed; 0 failed","role":"success"}
+@@RCB {"event":"phase","index":5,"name":"todo-tray","phase":"collect"}
+@@RCB {"event":"project_end","index":5,"name":"todo-tray","build":"PASS","test":"PASS","artifacts":1,"seconds":13.48,"rtk":"v1.0.2","errors":[],"hints":[]}
+@@RCB {"event":"log","text":"Summary","role":"heading"}
+@@RCB {"event":"log","text":"PASS  clock-widget, file-sorter, net-probe, todo-tray","role":"success"}
+@@RCB {"event":"log","text":"FAIL  pixel-paint","role":"danger"}
+@@RCB {"event":"log","text":"error[E0425]: cannot find value `canvas_width` in this scope","role":"danger"}
+@@RCB {"event":"log","text":"  --> src\\render.rs:42:18","role":"text"}
+@@RCB {"event":"log","text":"hint: Rename `canvas_width` to `canvas_w` in src\\render.rs line 42.","role":"info"}
+@@RCB {"event":"log","text":"rtk updated in 1 project: net-probe v0.8.2 -> v1.0.2","role":"rtkchange"}
+@@RCB {"event":"log","text":"Artifacts: C:\\Users\\dev\\projects\\rust-apps\\_built","role":"accent"}
+@@RCB {"event":"log","text":"Log file: C:\\Users\\dev\\projects\\rust-apps\\_built\\build-log.txt","role":"muted"}
+@@RCB {"event":"summary","success":false,"cancelled":false,"exit_code":1,"built_dir":"C:\\Users\\dev\\projects\\rust-apps\\_built","log_file":"C:\\Users\\dev\\projects\\rust-apps\\_built\\build-log.txt","passed":4,"failed":1}
