@@ -30,7 +30,9 @@ Build the GUI by hand: `cd gui` then `cargo build --release` (Windows or Linux).
 ## rtk update check
 Before each project builds, the script looks for [rtk](https://github.com/ubcool2ic/rtk) git dependencies in every `Cargo.toml` of the project (inline `rtk = { git = ... }`, renamed deps with `package = "rtk"`, `[dependencies.rtk]` tables, `target.'cfg(..)'` sections and `[workspace.dependencies]`).
 
-- **Latest release:** `git ls-remote --tags` with your own git login (Git Credential Manager), never prompting. If that fails and `GH_TOKEN` is set, it asks the GitHub API instead. Only stable `vX.Y.Z` tags count.
+- **Latest release:** `git ls-remote --tags` with your own git login (Git Credential Manager), never prompting. It always asks `https://github.com/ubcool2ic/rtk` first, even when a manifest uses an ssh URL. It then tries the manifest's other URLs, with a 15 s limit on each attempt. If all of them fail and `GH_TOKEN` is set, it asks the GitHub API instead, reading every page of tags. Only stable `vX.Y.Z` tags count.
+- **Manifests it understands:** inline tables and arrays that span several lines, and `"""`/`'''` strings. For workspaces it follows `members`/`exclude`, so excluded or non-member packages under a workspace root are built as separate projects.
+- **Long paths:** on Windows PowerShell 5.1, paths of 248+ characters use the `\\?\` prefix. If Windows still refuses a path, the message explains how to enable Win32 long paths.
 - **`tag = "..."` older than the latest:** backs up `Cargo.toml` + `Cargo.lock` to `_built\rtk-backup-<time>-<project>\`, rewrites the tag, runs `cargo update -p rtk`. The log and summary show `v0.8.2 -> v1.0.2` in colour. The rewrite is atomic and keeps BOM and line endings.
 - **`branch = "..."` or no pin:** always runs `cargo update -p rtk`.
 - **`rev = "..."`:** reported (latest or behind) but **not** rewritten, because a rev pin is a deliberate choice. Change it to a `tag` to get automatic bumps.

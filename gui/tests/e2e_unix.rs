@@ -77,8 +77,22 @@ fn launch(parsed: &Args) -> (Tk, UiHandles, Rc<RefCell<Vec<String>>>) {
 
 fn wait_finished(tk: &mut Tk, transcript: &Rc<RefCell<Vec<String>>>) {
     let deadline = Instant::now() + Duration::from_secs(120);
+    let mut seen = 0usize;
     loop {
         app::pump(tk);
+        // Nobody can click the yes/no dialog headlessly: answer prompts "yes".
+        let prompts = {
+            let lines = transcript.borrow();
+            let count = lines[seen..]
+                .iter()
+                .filter(|line| line.contains("Event(Prompt"))
+                .count();
+            seen = lines.len();
+            count
+        };
+        for _ in 0..prompts {
+            app::answer_prompt(true);
+        }
         let running = app::with_state(|s| s.is_running()).unwrap_or(false);
         if !running && !app::has_runner() {
             break;
@@ -213,6 +227,59 @@ fn real_build_script_through_the_gui() {
         assert!(transcript.borrow().is_empty());
         let hint = tk.widget_text(handles.error_label).unwrap_or_default();
         assert!(hint.contains("does not exist"), "hint was: {hint:?}");
+        app::teardown();
+    }
+
+    // --- Scenario D: rtk update check bumps the pinned tag -----------------
+    {
+        let git = bin.join("git");
+        let git_script = concat!(
+            "#!/bin/sh\n",
+            "for arg in \"$@\"; do\n",
+            "  if [ \"$arg\" = \"ls-remote\" ]; then\n",
+            "    printf '0000000000000000000000000000000000000001\\trefs/tags/v1.0.1\\n'\n",
+            "    printf '0000000000000000000000000000000000000002\\trefs/tags/v1.0.2\\n'\n",
+            "    exit 0\n",
+            "  fi\n",
+            "done\n",
+            "exit 0\n",
+        );
+        std::fs::write(&git, git_script).expect("write fake git");
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod git");
+
+        let projects = tmp.join("projects-rtk");
+        let project = projects.join("app-one");
+        copy_tree(&fixtures.join("tag-old"), &project);
+        let mut parsed = make_args(&script, &projects, ThemeChoice::Dark);
+        parsed.no_rtk_update = false;
+        let (mut tk, _handles, transcript) = launch(&parsed);
+        assert!(app::has_runner(), "Start build did not spawn the script");
+        wait_finished(&mut tk, &transcript);
+
+        let (status, exit, bump_in_rows) = app::with_state(|s| {
+            (
+                s.status(),
+                s.summary().map(|x| x.exit_code),
+                s.rows().iter().any(|r| r.rtk.contains("v0.8.2 -> v1.0.2")),
+            )
+        })
+        .expect("state");
+        let log = transcript.borrow().join("\n");
+        assert_eq!(status, Status::Passed, "{log}");
+        assert_eq!(exit, Some(0), "{log}");
+        let manifest =
+            std::fs::read_to_string(project.join("Cargo.toml")).expect("read Cargo.toml");
+        assert!(
+            manifest.contains("tag = \"v1.0.2\""),
+            "Cargo.toml was not bumped:\n{manifest}\n{log}"
+        );
+        assert!(
+            bump_in_rows || log.contains("v0.8.2 -> v1.0.2"),
+            "rtk bump not reported: {log}"
+        );
+
+        save(&mut tk, shots.as_ref(), "rcb-gui-e2e-rtk-bump-dark.png");
         app::teardown();
     }
 

@@ -29,6 +29,8 @@ const LOG_MIN_HEIGHT: f32 = 60.0;
 const LOG_PAD: f32 = 8.0;
 const LOG_LINE: f32 = 17.0;
 const LOG_FONT: f32 = 12.5;
+/// Most recent log lines drawn on the canvas (older ones are not drawn).
+const LOG_MAX_DRAWN: usize = 2000;
 /// Font size assumed when fitting ordinary label text.
 const LABEL_FONT: f32 = 13.0;
 /// Height of the custom-drawn progress bar.
@@ -51,6 +53,8 @@ struct RenderCache {
     counts: Option<(u64, u64)>,
     summary_text: Option<String>,
     log_rev: Option<u64>,
+    /// Scrollable content height set by the last log redraw.
+    log_content_h: Option<f32>,
 }
 
 /// Handles of every widget and variable the controller needs.
@@ -105,6 +109,10 @@ pub struct Ui {
     pub log_canvas: WidgetId,
     bar_size: (f32, f32),
     log_size: (f32, f32),
+    /// Height of one log line (monospace).
+    log_line: f32,
+    /// Estimated advance of one monospace log character.
+    log_char_w: f32,
     content_w: f32,
     cache: RefCell<RenderCache>,
 }
@@ -359,6 +367,12 @@ pub fn build(tk: &mut Tk, theme_choice: ThemeChoice) -> Result<Ui, RtkError> {
     let log_canvas = Canvas::new(tk, log_in, log_size.0, log_size.1)?;
     grid_row!(tk, log_canvas, 1, Sticky::W, SP_4);
     tk.a11y_set_label(log_canvas, "Build log");
+    // Canvas text uses the canvas widget's font family: make the log monospace.
+    tk.config(log_canvas, Opt::Monospace(true));
+    let (digits_w, glyph_h) = tk.text_size("0000000000", LOG_FONT, 400);
+    let log_line = (glyph_h + 3.0).ceil().max(LOG_LINE);
+    let log_char_w = (digits_w / 10.0).max(LOG_FONT * 0.6);
+    let _ = tk.canvas_scrollregion(log_canvas, log_size.0, log_size.1);
 
     Ok(Ui {
         status_chip,
@@ -387,6 +401,8 @@ pub fn build(tk: &mut Tk, theme_choice: ThemeChoice) -> Result<Ui, RtkError> {
         log_canvas,
         bar_size,
         log_size,
+        log_line,
+        log_char_w,
         content_w,
         cache: RefCell::new(RenderCache::default()),
     })
@@ -459,26 +475,70 @@ fn draw_bar(tk: &mut Tk, ui: &Ui, pct: i64) {
     }
 }
 
-/// Redraws the visible tail of the log on the canvas.
-fn draw_log(tk: &mut Tk, ui: &Ui, state: &BuildState) {
+/// Removes control characters and cuts `text` to at most `max_chars`
+/// characters (monospace fitting; no per-line text measurement).
+fn fit_mono(text: &str, max_chars: usize) -> String {
+    let mut chars = text
+        .chars()
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .filter(|c| !c.is_control());
+    let mut out: String = chars.by_ref().take(max_chars.max(2)).collect();
+    if chars.next().is_some() {
+        out.pop();
+        out.push('…');
+    }
+    out
+}
+
+/// Puts the vertical scroll offset back to `y` if a redraw moved it.
+fn restore_view(tk: &mut Tk, canvas: WidgetId, y: f32, content_h: f32, view_h: f32) {
+    let moved = |tk: &mut Tk| {
+        tk.canvas_view(canvas)
+            .map(|(_, now)| (now - y).abs() > 0.5)
+            .unwrap_or(false)
+    };
+    if !moved(tk) || content_h <= 0.0 {
+        return;
+    }
+    tk.yview_moveto(canvas, (y / content_h).clamp(0.0, 1.0));
+    if moved(tk) && content_h > view_h {
+        tk.yview_moveto(canvas, (y / (content_h - view_h)).clamp(0.0, 1.0));
+    }
+}
+
+/// Redraws the log (most recent `LOG_MAX_DRAWN` lines) as scrollable canvas
+/// content and returns the content height. The view stays pinned to the
+/// bottom unless the user had scrolled up by more than one line.
+fn draw_log(tk: &mut Tk, ui: &Ui, state: &BuildState, prev_content_h: Option<f32>) -> f32 {
     let pal = theme::log_palette(tk);
     let canvas = ui.log_canvas;
     let (w, h) = ui.log_size;
+    let line = ui.log_line;
+    let drawn = state.log_len().min(LOG_MAX_DRAWN);
+    let content_h = (2.0 * LOG_PAD + drawn as f32 * line).max(h);
+
+    // Decide before touching the canvas whether the user is at the bottom.
+    let view_y = tk.canvas_view(canvas).map(|(_, y)| y);
+    let pinned = match (view_y, prev_content_h) {
+        (Some(y), Some(prev)) => content_h < prev || y >= prev - h - line,
+        _ => true,
+    };
+
     tk.canvas_clear(canvas);
-    tk.canvas_create_rect(canvas, 0.0, 0.0, w, h, pal.card);
+    tk.canvas_create_rect(canvas, 0.0, 0.0, w, content_h, pal.card);
     tk.canvas_create_round_rect_outline(
         canvas,
         0.5,
         0.5,
         w - 0.5,
-        h - 0.5,
+        content_h - 0.5,
         8.0,
         Some(pal.bg),
         pal.border,
         1.0,
     );
     let text_x = LOG_PAD + 2.0;
-    if state.log_len() == 0 {
+    if drawn == 0 {
         tk.canvas_create_text_ex(
             canvas,
             text_x,
@@ -488,28 +548,33 @@ fn draw_log(tk: &mut Tk, ui: &Ui, state: &BuildState) {
             LOG_FONT,
             400,
         );
-        return;
-    }
-    // Only whole lines: the last one always ends above the bottom padding.
-    let visible = ((h - 2.0 * LOG_PAD) / LOG_LINE).floor().max(1.0) as usize;
-    let max_width = w - 2.0 * text_x;
-    let lines: Vec<(Role, String)> = state.log_tail(visible).cloned().collect();
-    for (row, (role, text)) in lines.iter().enumerate() {
-        let weight: u16 = if *role == Role::Heading { 700 } else { 400 };
-        let fitted = fit_text(tk, text, LOG_FONT, weight, max_width);
-        if fitted.is_empty() {
-            continue;
+    } else {
+        let max_chars = ((w - 2.0 * text_x) / ui.log_char_w).floor().max(8.0) as usize;
+        for (row, (role, text)) in state.log_tail(LOG_MAX_DRAWN).enumerate() {
+            let weight: u16 = if *role == Role::Heading { 700 } else { 400 };
+            let fitted = fit_mono(text, max_chars);
+            if fitted.is_empty() {
+                continue;
+            }
+            tk.canvas_create_text_ex(
+                canvas,
+                text_x,
+                LOG_PAD + row as f32 * line,
+                fitted,
+                pal.color(*role),
+                LOG_FONT,
+                weight,
+            );
         }
-        tk.canvas_create_text_ex(
-            canvas,
-            text_x,
-            LOG_PAD + row as f32 * LOG_LINE,
-            fitted,
-            pal.color(*role),
-            LOG_FONT,
-            weight,
-        );
     }
+
+    let _ = tk.canvas_scrollregion(canvas, w, content_h);
+    if pinned {
+        tk.yview_moveto(canvas, 1.0);
+    } else if let Some(y) = view_y {
+        restore_view(tk, canvas, y, content_h, h);
+    }
+    content_h
 }
 
 /// Pushes `state` to the widgets, touching only what changed since the last
@@ -612,7 +677,8 @@ pub fn render(tk: &mut Tk, ui: &Ui, state: &BuildState) {
     }
 
     if cache.log_rev != Some(state.log_revision()) {
-        draw_log(tk, ui, state);
+        let content_h = draw_log(tk, ui, state, cache.log_content_h);
+        cache.log_content_h = Some(content_h);
         cache.log_rev = Some(state.log_revision());
     }
 }
@@ -644,5 +710,64 @@ mod tests {
         );
         set_error(&mut tk, &ui, None);
         assert_eq!(tk.widget_text(ui.error_label).as_deref(), Some(HINT_TEXT));
+    }
+
+    #[test]
+    fn log_scrollback_stays_where_the_user_scrolled() {
+        /// Wheel amount in whatever numeric type `sim_wheel` takes.
+        fn lines<T: From<i8>>(n: i8) -> T {
+            T::from(n)
+        }
+
+        let mut tk = Tk::new();
+        tk.geometry(crate::WINDOW_WIDTH, crate::WINDOW_HEIGHT);
+        theme::apply(&mut tk, ThemeChoice::Dark);
+        let ui = build(&mut tk, ThemeChoice::Dark).expect("ui builds");
+        tk.sim_resize(crate::WINDOW_WIDTH, crate::WINDOW_HEIGHT);
+
+        let mut state = BuildState::new();
+        state.begin();
+        for i in 0..300 {
+            state.push_log(Role::Text, format!("log line {i}"));
+        }
+        render(&mut tk, &ui, &state);
+
+        let view_y = |tk: &mut Tk| {
+            tk.canvas_view(ui.log_canvas)
+                .map(|(_, y)| y)
+                .expect("log canvas has a view")
+        };
+
+        // Pinned at the bottom: scrolled away from the top, and asking for
+        // the bottom again does not move the view.
+        let bottom = view_y(&mut tk);
+        assert!(bottom > 0.0, "300 lines must overflow the log view");
+        tk.yview_moveto(ui.log_canvas, 1.0);
+        assert!((view_y(&mut tk) - bottom).abs() < 0.5, "not pinned to the bottom");
+
+        // Wheel up over the log (try the other sign if the first is "down").
+        let rect = tk.widget_rect(ui.log_canvas).expect("log canvas rect");
+        tk.sim_mouse_move(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        for _ in 0..4 {
+            tk.sim_wheel(lines(3));
+        }
+        if view_y(&mut tk) >= bottom - 0.5 {
+            for _ in 0..4 {
+                tk.sim_wheel(lines(-3));
+            }
+        }
+        let up = view_y(&mut tk);
+        assert!(up < bottom - 0.5, "wheel did not scroll up: {up} vs {bottom}");
+
+        // A new line must not drag the view back to the bottom.
+        state.push_log(Role::Text, "one more line");
+        render(&mut tk, &ui, &state);
+        let after = view_y(&mut tk);
+        tk.yview_moveto(ui.log_canvas, 1.0);
+        let new_bottom = view_y(&mut tk);
+        assert!(
+            after < new_bottom - 0.5,
+            "view jumped to the bottom: {after} vs {new_bottom}"
+        );
     }
 }

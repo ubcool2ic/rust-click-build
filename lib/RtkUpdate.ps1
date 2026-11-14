@@ -37,6 +37,10 @@ $script:RtkReInline     = New-Object System.Text.RegularExpressions.Regex('^(["'
 $script:RtkReDotted     = New-Object System.Text.RegularExpressions.Regex('^(["'']?)([A-Za-z0-9_\-]+)\1\s*\.\s*([A-Za-z0-9_\-]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|''([^'']*)'')', $script:RtkReOptions)
 $script:RtkReWorkspace  = New-Object System.Text.RegularExpressions.Regex('(?m)^[ \t]*\[\s*workspace\s*[\].]', $script:RtkReOptions)
 $script:RtkQuoteChars   = [char[]]@([char]34, [char]39)
+$script:RtkOpenChars    = [char[]]@([char]91, [char]123)
+$script:RcbGlobChars    = [char[]]@([char]42, [char]63)
+$script:RcbReWsArray    = New-Object System.Text.RegularExpressions.Regex('^(["'']?)(members|exclude)\1\s*=\s*\[(.*)\]$', $script:RtkReOptions)
+$script:RcbReTomlString = New-Object System.Text.RegularExpressions.Regex('"((?:[^"\\]|\\.)*)"|''([^'']*)''', $script:RtkReOptions)
 
 # Directory names never descended into while looking for Cargo.toml files.
 $script:RcbPrunedDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -59,6 +63,72 @@ function Resolve-RcbFullPath {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path)) { return $Path }
     try { return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path) } catch { return $Path }
+}
+
+# Shown whenever a file operation still fails with PathTooLongException.
+$script:RcbLongPathHint = 'path is longer than 260 characters; enable Win32 long paths (gpedit: Computer Configuration > Administrative Templates > System > Filesystem > Enable Win32 long paths, or registry HKLM\SYSTEM\CurrentControlSet\Control\FileSystem LongPathsEnabled=1) or move the project to a shorter folder'
+
+<#
+.SYNOPSIS
+    True on Windows PowerShell 5.1 (.NET Framework), where paths of 260+
+    characters (248+ for folders) are rejected unless they carry \\?\.
+#>
+function Test-RcbLegacyPathRuntime {
+    return ($env:OS -eq 'Windows_NT' -and $PSVersionTable.PSVersion.Major -lt 6)
+}
+
+<#
+.SYNOPSIS
+    Adds the \\?\ (or \\?\UNC\) long-path prefix to a full Windows path when
+    running under .NET Framework and the path has 248+ characters, or always
+    with -Force. Never double-prefixes; relative, device and non-Windows
+    paths are returned unchanged.
+#>
+function ConvertTo-RcbLongPath {
+    param([string]$Path, [switch]$Force)
+    if ([string]::IsNullOrEmpty($Path)) { return $Path }
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal)) { return $Path }
+    if (-not $Force) {
+        if ($Path.Length -lt 248) { return $Path }
+        if (-not (Test-RcbLegacyPathRuntime)) { return $Path }
+    }
+    if ($Path.StartsWith('\\.\', [System.StringComparison]::Ordinal)) { return $Path }
+    if ($Path.StartsWith('\\', [System.StringComparison]::Ordinal)) {
+        return ('\\?\UNC\' + $Path.Substring(2).Replace('/', '\'))
+    }
+    if ($Path.Length -ge 3 -and [char]::IsLetter($Path[0]) -and $Path[1] -eq [char]58 -and ($Path[2] -eq [char]92 -or $Path[2] -eq [char]47)) {
+        return ('\\?\' + $Path.Replace('/', '\'))
+    }
+    return $Path
+}
+
+<#
+.SYNOPSIS
+    Removes the \\?\ or \\?\UNC\ prefix again (for paths shown to the user
+    or handed back to callers).
+#>
+function ConvertFrom-RcbLongPath {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) { return $Path }
+    if ($Path.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return ('\\' + $Path.Substring(8)) }
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal)) { return $Path.Substring(4) }
+    return $Path
+}
+
+<#
+.SYNOPSIS
+    Message text for an exception: the long-path hint when the exception (or
+    any inner exception) is a PathTooLongException, else its Message.
+#>
+function Get-RcbErrorText {
+    param($Exception)
+    if ($null -eq $Exception) { return '' }
+    $e = $Exception
+    while ($null -ne $e) {
+        if ($e -is [System.IO.PathTooLongException]) { return $script:RcbLongPathHint }
+        $e = $e.InnerException
+    }
+    return [string]$Exception.Message
 }
 
 <#
@@ -164,6 +234,9 @@ function ConvertTo-RcbSafeFileName {
 function Write-RcbFileAtomic {
     param([Parameter(Mandatory = $true)][string]$Path, [byte[]]$Bytes)
     if ($null -eq $Bytes) { $Bytes = New-Object byte[] 0 }
+    # The temp name adds 41 characters, so decide on the long-path prefix with that included.
+    $forceLong = ((Test-RcbLegacyPathRuntime) -and (($Path.Length + 41) -ge 248))
+    $Path = ConvertTo-RcbLongPath $Path -Force:$forceLong
     $tmp = $Path + '.rcb-tmp-' + [guid]::NewGuid().ToString('N')
     try {
         [System.IO.File]::WriteAllBytes($tmp, $Bytes)
@@ -257,12 +330,24 @@ function Test-RtkGitUrl {
 
 <#
 .SYNOPSIS
+    Maps any accepted rtk git URL form (scp-like ssh, ssh://, git://, http(s),
+    with or without .git, trailing slash or userinfo) to the canonical
+    https URL. Returns $null for anything that is not the rtk repository.
+#>
+function ConvertTo-RtkHttpsUrl {
+    param([string]$Url)
+    if (-not (Test-RtkGitUrl $Url)) { return $null }
+    return 'https://github.com/ubcool2ic/rtk'
+}
+
+<#
+.SYNOPSIS
     Parses the top-level "key = string" pairs of an inline table body (or a
     single "key = value" line). Strings, arrays and nested tables are skipped
     correctly; only string values are returned. Keys are case-sensitive.
 #>
 function ConvertFrom-RtkInlineTable {
-    param([string]$Body)
+    param([string]$Body, $Positions = $null)
     $map = New-Object 'System.Collections.Generic.Dictionary[string,string]'
     if ([string]::IsNullOrEmpty($Body)) { return ,$map }
     $n = $Body.Length
@@ -277,6 +362,8 @@ function ConvertFrom-RtkInlineTable {
         while ($i -lt $n -and ($Body[$i] -eq [char]32 -or $Body[$i] -eq [char]9)) { $i++ }
         if ($i -ge $n) { break }
         $ch = $Body[$i]
+        # Optional: offset (inside $Body) where the value of each key starts.
+        if ($null -ne $Positions) { $Positions[$key] = $i }
         if ($ch -eq [char]34) {
             # basic string: backslash escapes the next character
             $sb = New-Object System.Text.StringBuilder
@@ -360,6 +447,158 @@ function Remove-TomlComment {
 
 <#
 .SYNOPSIS
+    Joins physical TOML lines into logical lines. Internal helper.
+
+.DESCRIPTION
+    Physical lines are accumulated while a bracket or brace is open outside a
+    string, or while a multi-line string (""" or ''') is open. Comments are
+    removed, the content of multi-line strings is dropped (the value becomes
+    an empty string) and the pieces are joined with one space. Each result
+    is a hashtable: Text (trimmed), Start (0-based physical line of the first
+    piece) and Offsets (start offset in Text of every physical line, or
+    $null when the logical line is a single physical line).
+#>
+function Get-RtkLogicalLine {
+    param([string[]]$Lines)
+    $out = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Lines) { return ,$out }
+    $ord = [System.StringComparison]::Ordinal
+    $dq3 = '"""'
+    $sq3 = "'''"
+    $sb = New-Object System.Text.StringBuilder
+    $offsets = New-Object System.Collections.Generic.List[int]
+    $depth = 0
+    $ml = 0          # 0 = none, 1 = inside """, 2 = inside '''
+    $start = -1
+    $last = $Lines.Length - 1
+    for ($li = 0; $li -le $last; $li++) {
+        $raw = [string]$Lines[$li]
+        if ($raw.Length -gt 0 -and $raw[$raw.Length - 1] -eq [char]13) { $raw = $raw.Substring(0, $raw.Length - 1) }
+        if ($start -lt 0) {
+            # Fast path: nothing on this line can open a multi-line construct.
+            if ($raw.IndexOfAny($script:RtkOpenChars) -lt 0 -and $raw.IndexOf($dq3, $ord) -lt 0 -and $raw.IndexOf($sq3, $ord) -lt 0) {
+                $t = $raw
+                if ($t.IndexOf('#') -ge 0) { $t = Remove-TomlComment $t }
+                $t = $t.Trim()
+                if ($t.Length -gt 0) { $out.Add(@{ Text = $t; Start = $li; Offsets = $null }) }
+                continue
+            }
+            $start = $li
+            $sb.Length = 0
+            $offsets.Clear()
+            $depth = 0
+            $ml = 0
+        } else {
+            [void]$sb.Append(' ')
+        }
+        $offsets.Add($sb.Length)
+
+        $n = $raw.Length
+        $i = 0
+        while ($i -lt $n) {
+            $c = $raw[$i]
+            if ($ml -eq 1) {
+                if ($c -eq [char]92) { $i += 2; continue }
+                if ($c -eq [char]34 -and ($i + 2) -lt $n -and $raw[$i + 1] -eq [char]34 -and $raw[$i + 2] -eq [char]34) {
+                    $i += 3
+                    $extra = 0
+                    while ($extra -lt 2 -and $i -lt $n -and $raw[$i] -eq [char]34) { $i++; $extra++ }
+                    $ml = 0
+                    continue
+                }
+                $i++
+                continue
+            }
+            if ($ml -eq 2) {
+                $e = $raw.IndexOf($sq3, $i, $ord)
+                if ($e -lt 0) { break }
+                $i = $e + 3
+                $extra = 0
+                while ($extra -lt 2 -and $i -lt $n -and $raw[$i] -eq [char]39) { $i++; $extra++ }
+                $ml = 0
+                continue
+            }
+            if ($c -eq [char]34) {
+                if (($i + 2) -lt $n -and $raw[$i + 1] -eq [char]34 -and $raw[$i + 2] -eq [char]34) {
+                    [void]$sb.Append('""')
+                    $ml = 1
+                    $i += 3
+                    continue
+                }
+                $j = $i + 1
+                while ($j -lt $n -and $raw[$j] -ne [char]34) {
+                    if ($raw[$j] -eq [char]92) { $j++ }
+                    $j++
+                }
+                if ($j -ge $n) { $j = $n - 1 }
+                [void]$sb.Append($raw.Substring($i, $j - $i + 1))
+                $i = $j + 1
+                continue
+            }
+            if ($c -eq [char]39) {
+                if (($i + 2) -lt $n -and $raw[$i + 1] -eq [char]39 -and $raw[$i + 2] -eq [char]39) {
+                    [void]$sb.Append("''")
+                    $ml = 2
+                    $i += 3
+                    continue
+                }
+                $j = -1
+                if (($i + 1) -lt $n) { $j = $raw.IndexOf([char]39, $i + 1) }
+                if ($j -lt 0) { $j = $n - 1 }
+                [void]$sb.Append($raw.Substring($i, $j - $i + 1))
+                $i = $j + 1
+                continue
+            }
+            if ($c -eq [char]35) { break }
+            if ($c -eq [char]91 -or $c -eq [char]123) { $depth++ }
+            elseif ($c -eq [char]93 -or $c -eq [char]125) { if ($depth -gt 0) { $depth-- } }
+            [void]$sb.Append($c)
+            $i++
+        }
+
+        if (($depth -le 0 -and $ml -eq 0) -or $li -eq $last) {
+            $text = $sb.ToString()
+            $lead = 0
+            while ($lead -lt $text.Length -and [char]::IsWhiteSpace($text[$lead])) { $lead++ }
+            $t = $text.Trim()
+            if ($t.Length -gt 0) {
+                $offs = $null
+                if ($offsets.Count -gt 1) {
+                    $offs = New-Object int[] $offsets.Count
+                    for ($k = 0; $k -lt $offsets.Count; $k++) {
+                        $v = $offsets[$k] - $lead
+                        if ($v -lt 0) { $v = 0 }
+                        $offs[$k] = $v
+                    }
+                }
+                $out.Add(@{ Text = $t; Start = $start; Offsets = $offs })
+            }
+            $start = -1
+            $depth = 0
+            $ml = 0
+        }
+    }
+    return ,$out
+}
+
+<#
+.SYNOPSIS
+    0-based physical line that holds the character at $Offset of a logical
+    line produced by Get-RtkLogicalLine. Internal helper.
+#>
+function Get-RtkPhysicalLine {
+    param($Logical, [int]$Offset)
+    $offs = $Logical.Offsets
+    if ($null -eq $offs) { return [int]$Logical.Start }
+    $k = 0
+    for ($j = 1; $j -lt $offs.Length; $j++) {
+        if ($offs[$j] -le $Offset) { $k = $j } else { break }
+    }
+    return ([int]$Logical.Start + $k)
+}
+
+<#
+.SYNOPSIS
     Adds a table-form or dotted-key dependency to the result list when its git
     URL is rtk. Internal helper for Get-RtkDependency.
 #>
@@ -399,23 +638,25 @@ function Get-RtkDependency {
     param([Parameter(Mandatory = $true)][string]$ManifestPath)
 
     $results = New-Object System.Collections.Generic.List[PSCustomObject]
-    $full = Resolve-RcbFullPath $ManifestPath
+    $full = ConvertTo-RcbLongPath (Resolve-RcbFullPath $ManifestPath)
     if (-not [System.IO.File]::Exists($full)) { return $results.ToArray() }
     $text = [System.IO.File]::ReadAllText($full)
     # Fast path: no "rtk" anywhere means no rtk dependency.
     if ($text.IndexOf('rtk', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $results.ToArray() }
     if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
     $lines = $text.Split([char]10)
+    # Logical lines: multi-line inline tables, arrays and """/''' strings are
+    # joined (string content dropped); each keeps its physical line numbers.
+    $logical = Get-RtkLogicalLine -Lines $lines
 
     $section = ''
     $inDeps = $false
     $tableDep = $null   # state while inside [....dependencies.<name>]
     $dotted = $null     # name -> state for dotted keys inside a dependencies section
 
-    for ($i = 0; $i -lt $lines.Length; $i++) {
-        $line = $lines[$i]
-        if ($line.IndexOf('#') -ge 0) { $line = Remove-TomlComment $line }
-        $line = $line.Trim()
+    foreach ($ll in $logical) {
+        $line = [string]$ll.Text
+        $i = [int]$ll.Start
         if ($line.Length -eq 0) { continue }
 
         if ($line[0] -eq [char]91) {
@@ -449,8 +690,9 @@ function Get-RtkDependency {
             if ($kv.Success) {
                 $k = $kv.Groups[2].Value
                 $v = if ($kv.Groups[3].Success) { $kv.Groups[3].Value } else { $kv.Groups[4].Value }
+                $vi = if ($kv.Groups[3].Success) { $kv.Groups[3].Index } else { $kv.Groups[4].Index }
                 if ($k -ceq 'git') { $tableDep.Git = $v }
-                elseif ($k -ceq 'tag' -or $k -ceq 'rev' -or $k -ceq 'branch') { $tableDep.Pins[$k] = @{ Value = $v; Line = $i } }
+                elseif ($k -ceq 'tag' -or $k -ceq 'rev' -or $k -ceq 'branch') { $tableDep.Pins[$k] = @{ Value = $v; Line = (Get-RtkPhysicalLine $ll $vi) } }
             }
             continue
         }
@@ -461,13 +703,19 @@ function Get-RtkDependency {
             if ($line.IndexOf('git', [System.StringComparison]::Ordinal) -lt 0) { continue }
             $im = $script:RtkReInline.Match($line)
             if (-not $im.Success) { continue }
-            $map = ConvertFrom-RtkInlineTable $im.Groups[3].Value
+            $posMap = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+            $map = ConvertFrom-RtkInlineTable -Body $im.Groups[3].Value -Positions $posMap
             if (-not $map.ContainsKey('git')) { continue }
             $git = $map['git']
             if (-not (Test-RtkGitUrl $git)) { continue }
-            $kind = 'none'; $val = $null
+            $kind = 'none'; $val = $null; $pinLine = $i
             foreach ($k in @('tag', 'rev', 'branch')) {
-                if ($map.ContainsKey($k)) { $kind = $k; $val = $map[$k]; break }
+                if ($map.ContainsKey($k)) {
+                    $kind = $k; $val = $map[$k]
+                    # Physical line holding the pin value (the table may span lines).
+                    if ($posMap.ContainsKey($k)) { $pinLine = Get-RtkPhysicalLine $ll ($im.Groups[3].Index + $posMap[$k]) }
+                    break
+                }
             }
             $results.Add([PSCustomObject]@{
                 ManifestPath = $ManifestPath
@@ -476,7 +724,7 @@ function Get-RtkDependency {
                 GitUrl       = $git
                 PinKind      = $kind
                 PinValue     = $val
-                LineIndex    = $i
+                LineIndex    = $pinLine
                 Form         = 'inline'
             })
             continue
@@ -489,13 +737,14 @@ function Get-RtkDependency {
         $name = $dk.Groups[2].Value
         $k = $dk.Groups[3].Value
         $v = if ($dk.Groups[4].Success) { $dk.Groups[4].Value } else { $dk.Groups[5].Value }
+        $vi = if ($dk.Groups[4].Success) { $dk.Groups[4].Index } else { $dk.Groups[5].Index }
         if ($null -eq $dotted) { $dotted = New-Object System.Collections.Specialized.OrderedDictionary }
         if (-not $dotted.Contains($name)) {
             $dotted[$name] = @{ Name = $name; Section = $section; HeaderLine = $i; Git = $null; Pins = @{} }
         }
         $state = $dotted[$name]
         if ($k -ceq 'git') { $state.Git = $v }
-        elseif ($k -ceq 'tag' -or $k -ceq 'rev' -or $k -ceq 'branch') { $state.Pins[$k] = @{ Value = $v; Line = $i } }
+        elseif ($k -ceq 'tag' -or $k -ceq 'rev' -or $k -ceq 'branch') { $state.Pins[$k] = @{ Value = $v; Line = (Get-RtkPhysicalLine $ll $vi) } }
     }
     if ($null -ne $tableDep) { Add-RtkTableDep -Dep $tableDep -Results $results -ManifestPath $ManifestPath -Form 'table' }
     if ($null -ne $dotted) {
@@ -512,10 +761,156 @@ function Get-RtkDependency {
 function Test-RcbWorkspaceManifest {
     param([string]$ManifestPath)
     $text = $null
-    try { $text = [System.IO.File]::ReadAllText((Resolve-RcbFullPath $ManifestPath)) } catch { return $false }
+    try { $text = [System.IO.File]::ReadAllText((ConvertTo-RcbLongPath (Resolve-RcbFullPath $ManifestPath))) } catch { return $false }
     if ([string]::IsNullOrEmpty($text)) { return $false }
     if ($text.IndexOf('workspace', [System.StringComparison]::Ordinal) -lt 0) { return $false }
     return $script:RtkReWorkspace.IsMatch($text)
+}
+
+<#
+.SYNOPSIS
+    Reads the [workspace] table of a Cargo.toml.
+
+.DESCRIPTION
+    Returns a hashtable: IsWorkspace, Members ([string[]] globs), Exclude
+    ([string[]]) and HasPackage (the manifest also has [package]). Arrays may
+    span lines. Unreadable files give IsWorkspace = $false and empty lists.
+#>
+function Get-RcbWorkspaceInfo {
+    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+    $info = @{ IsWorkspace = $false; Members = [string[]]@(); Exclude = [string[]]@(); HasPackage = $false }
+    $text = $null
+    try { $text = [System.IO.File]::ReadAllText((ConvertTo-RcbLongPath (Resolve-RcbFullPath $ManifestPath))) } catch { return $info }
+    if ([string]::IsNullOrEmpty($text)) { return $info }
+    if ($text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    $members = New-Object System.Collections.Generic.List[string]
+    $exclude = New-Object System.Collections.Generic.List[string]
+    $section = ''
+    foreach ($ll in (Get-RtkLogicalLine -Lines $text.Split([char]10))) {
+        $line = [string]$ll.Text
+        if ($line.Length -eq 0) { continue }
+        if ($line[0] -eq [char]91) {
+            if ($line.StartsWith('[[', [System.StringComparison]::Ordinal)) { $section = $line; continue }
+            $h = $script:RtkReHeader.Match($line)
+            if (-not $h.Success) { continue }
+            $section = $h.Groups[1].Value
+            if ($section -ceq 'workspace' -or $section -cmatch '^workspace\s*\.') { $info.IsWorkspace = $true }
+            elseif ($section -ceq 'package') { $info.HasPackage = $true }
+            continue
+        }
+        if ($section -cne 'workspace') { continue }
+        $m = $script:RcbReWsArray.Match($line)
+        if (-not $m.Success) { continue }
+        $target = $members
+        if ($m.Groups[2].Value -ceq 'exclude') { $target = $exclude }
+        foreach ($sm in $script:RcbReTomlString.Matches($m.Groups[3].Value)) {
+            $s = $null
+            if ($sm.Groups[1].Success) { $s = [regex]::Replace($sm.Groups[1].Value, '\\(.)', '$1') } else { $s = $sm.Groups[2].Value }
+            if (-not [string]::IsNullOrEmpty($s) -and $s.Trim().Length -gt 0) { $target.Add($s.Trim()) }
+        }
+    }
+    $info.Members = [string[]]$members.ToArray()
+    $info.Exclude = [string[]]$exclude.ToArray()
+    return $info
+}
+
+<#
+.SYNOPSIS
+    Appends the normalized segments of a path to two parallel lists (segment
+    text, and whether it came from a glob pattern). "." is dropped and ".."
+    removes the previous segment. Internal helper.
+#>
+function Add-RcbPathSegment {
+    param([string]$Path, $Segments, $Flags, [bool]$IsPattern)
+    foreach ($s in ([string]$Path).Replace('\', '/').Split([char]47)) {
+        if ($s.Length -eq 0 -or $s -ceq '.') { continue }
+        if ($s -ceq '..') {
+            if ($Segments.Count -gt 0) { $Segments.RemoveAt($Segments.Count - 1); $Flags.RemoveAt($Flags.Count - 1) }
+            continue
+        }
+        $Segments.Add($s)
+        $Flags.Add($IsPattern)
+    }
+}
+
+<#
+.SYNOPSIS
+    Compares pattern segments with path segments ('*' and '?' only inside
+    pattern segments, never across '/'). Internal helper.
+#>
+function Test-RcbSegmentMatch {
+    param($PatSegs, $PatFlags, $PathSegs, [bool]$PrefixOnly, [bool]$IgnoreCase)
+    if ($PrefixOnly) {
+        if ($PatSegs.Count -gt $PathSegs.Count) { return $false }
+    } elseif ($PatSegs.Count -ne $PathSegs.Count) {
+        return $false
+    }
+    $cmp = [System.StringComparison]::Ordinal
+    $opt = [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    if ($IgnoreCase) {
+        $cmp = [System.StringComparison]::OrdinalIgnoreCase
+        $opt = $opt -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    }
+    for ($i = 0; $i -lt $PatSegs.Count; $i++) {
+        $pat = [string]$PatSegs[$i]
+        $name = [string]$PathSegs[$i]
+        if ($PatFlags[$i] -and $pat.IndexOfAny($script:RcbGlobChars) -ge 0) {
+            $rx = '^' + [regex]::Escape($pat).Replace('\*', '[^/]*').Replace('\?', '[^/]') + '$'
+            if (-not [regex]::IsMatch($name, $rx, $opt)) { return $false }
+        } elseif (-not [string]::Equals($pat, $name, $cmp)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+<#
+.SYNOPSIS
+    True when a package folder is a member of a workspace.
+
+.DESCRIPTION
+    Cargo-like rules: the root folder itself is always a member; a folder at
+    or below an exclude path is not; otherwise it must match one member
+    pattern exactly. Patterns are relative to the root; '*' and '?' match
+    inside one path segment ('**' is not supported and acts like '*').
+#>
+function Test-RcbWorkspaceMember {
+    param(
+        [string]$WorkspaceRoot,
+        [string]$PackageDir,
+        [string[]]$Members = @(),
+        [string[]]$Exclude = @()
+    )
+    if ([string]::IsNullOrEmpty($WorkspaceRoot) -or [string]::IsNullOrEmpty($PackageDir)) { return $false }
+    $ci = ($env:OS -eq 'Windows_NT')
+    $rootSegs = New-Object System.Collections.Generic.List[string]
+    $rootFlags = New-Object System.Collections.Generic.List[bool]
+    Add-RcbPathSegment (Resolve-RcbFullPath $WorkspaceRoot) $rootSegs $rootFlags $false
+    $pkgSegs = New-Object System.Collections.Generic.List[string]
+    $pkgFlags = New-Object System.Collections.Generic.List[bool]
+    Add-RcbPathSegment (Resolve-RcbFullPath $PackageDir) $pkgSegs $pkgFlags $false
+
+    if (Test-RcbSegmentMatch $rootSegs $rootFlags $pkgSegs $false $ci) { return $true }
+
+    foreach ($ex in @($Exclude)) {
+        if ([string]::IsNullOrEmpty($ex) -or $ex.Trim().Length -eq 0) { continue }
+        $segs = New-Object System.Collections.Generic.List[string]
+        $flags = New-Object System.Collections.Generic.List[bool]
+        $segs.AddRange($rootSegs)
+        $flags.AddRange($rootFlags)
+        Add-RcbPathSegment $ex $segs $flags $true
+        if (Test-RcbSegmentMatch $segs $flags $pkgSegs $true $ci) { return $false }
+    }
+    foreach ($mb in @($Members)) {
+        if ([string]::IsNullOrEmpty($mb) -or $mb.Trim().Length -eq 0) { continue }
+        $segs = New-Object System.Collections.Generic.List[string]
+        $flags = New-Object System.Collections.Generic.List[bool]
+        $segs.AddRange($rootSegs)
+        $flags.AddRange($rootFlags)
+        Add-RcbPathSegment $mb $segs $flags $true
+        if (Test-RcbSegmentMatch $segs $flags $pkgSegs $false $ci) { return $true }
+    }
+    return $false
 }
 
 <#
@@ -526,8 +921,11 @@ function Test-RcbWorkspaceManifest {
 .DESCRIPTION
     Uses an explicit stack (no recursion), skips reparse points (junctions and
     symlinks, so loops cannot hang the walk) and folders that cannot be read.
-    With -ExcludeWorkspaceMembers a folder whose Cargo.toml declares a
-    workspace is returned but not descended into. Parents come before their
+    With -ExcludeWorkspaceMembers a workspace root is returned and the walk
+    goes on below it, skipping only member package folders (and their
+    subtrees), so excluded and non-member packages are found as separate
+    projects. A workspace without a members list is not descended into
+    (everything below counts as a member). Parents come before their
     children; siblings are in ordinal (case-insensitive) order.
 #>
 function Get-RcbCargoManifest {
@@ -537,33 +935,57 @@ function Get-RcbCargoManifest {
     )
     $found = New-Object System.Collections.Generic.List[string]
     $root = Resolve-RcbFullPath $RootDirectory
-    if ([string]::IsNullOrEmpty($root) -or -not [System.IO.Directory]::Exists($root)) { return $found.ToArray() }
+    if ([string]::IsNullOrEmpty($root) -or -not [System.IO.Directory]::Exists((ConvertTo-RcbLongPath $root))) { return $found.ToArray() }
+    # Paths kept in $stack/$found stay un-prefixed; only the I/O calls get \\?\.
+    $legacy = Test-RcbLegacyPathRuntime
     $reparse = [System.IO.FileAttributes]::ReparsePoint
     $stack = New-Object System.Collections.Generic.Stack[string]
     $stack.Push($root)
+    # Parallel stack: the enclosing workspace (Root/Members/Exclude) or $null.
+    $ctxStack = New-Object System.Collections.Generic.Stack[object]
+    $ctxStack.Push($null)
     $subs = New-Object System.Collections.Generic.List[string]
     while ($stack.Count -gt 0) {
         $dir = $stack.Pop()
+        $ctx = $ctxStack.Pop()
         $manifest = [System.IO.Path]::Combine($dir, 'Cargo.toml')
         $isFile = $false
-        try { $isFile = [System.IO.File]::Exists($manifest) } catch { $isFile = $false }
+        $manifestIo = $manifest
+        $dirIo = $dir
+        if ($legacy) {
+            $manifestIo = ConvertTo-RcbLongPath $manifest
+            $dirIo = ConvertTo-RcbLongPath $dir
+        }
+        try { $isFile = [System.IO.File]::Exists($manifestIo) } catch { $isFile = $false }
         if ($isFile) {
             $found.Add($manifest)
-            if ($ExcludeWorkspaceMembers -and (Test-RcbWorkspaceManifest $manifest)) { continue }
+            if ($ExcludeWorkspaceMembers -and (Test-RcbWorkspaceManifest $manifest)) {
+                $wsInfo = Get-RcbWorkspaceInfo -ManifestPath $manifest
+                if ($wsInfo.IsWorkspace) {
+                    # No members list (virtual manifest without members, or a
+                    # package with a bare [workspace]): keep the old behaviour
+                    # and treat everything below as members.
+                    if ($wsInfo.Members.Length -eq 0) { continue }
+                    $ctx = @{ Root = $dir; Members = $wsInfo.Members; Exclude = $wsInfo.Exclude }
+                }
+            }
         }
         $subs.Clear()
         try {
-            foreach ($d in (New-Object System.IO.DirectoryInfo($dir)).EnumerateDirectories()) {
+            foreach ($d in (New-Object System.IO.DirectoryInfo($dirIo)).EnumerateDirectories()) {
                 if ($script:RcbPrunedDirs.Contains($d.Name)) { continue }
                 if (($d.Attributes -band $reparse) -ne 0) { continue }
-                $subs.Add($d.FullName)
+                $sub = [System.IO.Path]::Combine($dir, $d.Name)
+                # Member packages belong to the workspace root: skip them and their subtree.
+                if ($null -ne $ctx -and (Test-RcbWorkspaceMember -WorkspaceRoot $ctx.Root -PackageDir $sub -Members $ctx.Members -Exclude $ctx.Exclude)) { continue }
+                $subs.Add($sub)
             }
         } catch {
             # Access denied, path too long or folder removed while walking: skip it.
             $null = $_
         }
         if ($subs.Count -gt 1) { $subs.Sort([System.StringComparer]::OrdinalIgnoreCase) }
-        for ($j = $subs.Count - 1; $j -ge 0; $j--) { $stack.Push($subs[$j]) }
+        for ($j = $subs.Count - 1; $j -ge 0; $j--) { $stack.Push($subs[$j]); $ctxStack.Push($ctx) }
     }
     return $found.ToArray()
 }
@@ -576,13 +998,18 @@ function Get-RcbCargoManifest {
 function Get-ProjectManifestSet {
     param([Parameter(Mandatory = $true)][string]$ManifestPath)
     $full = Resolve-RcbFullPath $ManifestPath
-    if (-not [System.IO.File]::Exists($full)) { return @($ManifestPath) }
+    if (-not [System.IO.File]::Exists((ConvertTo-RcbLongPath $full))) { return @($ManifestPath) }
     if (-not (Test-RcbWorkspaceManifest $full)) { return @($ManifestPath) }
+    $wsInfo = Get-RcbWorkspaceInfo -ManifestPath $full
+    if (-not $wsInfo.IsWorkspace) { return @($ManifestPath) }
     $root = [System.IO.Path]::GetDirectoryName($full)
     $list = New-Object System.Collections.Generic.List[string]
     $list.Add($ManifestPath)
+    # No members list: old behaviour, every manifest below the root counts as a member.
+    $filter = ($wsInfo.Members.Length -gt 0)
     foreach ($f in @(Get-RcbCargoManifest -RootDirectory $root)) {
-        if ([string]::Equals([System.IO.Path]::GetDirectoryName($f), $root, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ([string]::Equals($f, [System.IO.Path]::Combine($root, 'Cargo.toml'), [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($filter -and -not (Test-RcbWorkspaceMember -WorkspaceRoot $root -PackageDir ([System.IO.Path]::GetDirectoryName($f)) -Members $wsInfo.Members -Exclude $wsInfo.Exclude)) { continue }
         $list.Add($f)
     }
     return $list.ToArray()
@@ -606,7 +1033,7 @@ function Set-RtkTagPin {
     )
     if ($NewTag -match '["''\\\r\n]') { throw "Refusing to write tag '$NewTag': it contains quote, backslash or newline characters." }
     $full = Resolve-RcbFullPath $ManifestPath
-    $bytes = [System.IO.File]::ReadAllBytes($full)
+    $bytes = [System.IO.File]::ReadAllBytes((ConvertTo-RcbLongPath $full))
     $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
     $offset = 0
     if ($hasBom) { $offset = 3 }
@@ -692,20 +1119,23 @@ function Invoke-RtkProcess {
     Returns the raw ls-remote result object. Mocked in tests.
 #>
 function Invoke-RtkLsRemote {
-    param([string]$RepoUrl)
+    param([string]$RepoUrl, [int]$TimeoutSec = 45)
+    if ($TimeoutSec -le 0) { $TimeoutSec = 45 }
     if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) {
         return [PSCustomObject]@{ ExitCode = 127; StdOut = ''; StdErr = 'git is not installed or not on PATH'; TimedOut = $false }
     }
     # "--" so a URL read from a Cargo.toml can never be taken as a git option.
-    return Invoke-RtkProcess -FilePath 'git' -ArgumentList @('ls-remote', '--tags', '--', $RepoUrl)
+    return Invoke-RtkProcess -FilePath 'git' -ArgumentList @('ls-remote', '--tags', '--', $RepoUrl) -TimeoutSec $TimeoutSec
 }
 
 <#
 .SYNOPSIS
-    Lists rtk tag names from the GitHub API using GH_TOKEN. Mocked in tests.
+    Reads one page (100 tags) of rtk tag names from the GitHub API using
+    GH_TOKEN. Returns the page as an array of Name/Sha objects. Mocked in tests.
 #>
-function Invoke-RtkTagApi {
-    param([string]$Token)
+function Invoke-RtkTagApiPage {
+    param([string]$Token, [int]$Page = 1)
+    if ($Page -lt 1) { $Page = 1 }
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         # Windows PowerShell may default to TLS 1.0; GitHub needs TLS 1.2.
         try {
@@ -713,8 +1143,33 @@ function Invoke-RtkTagApi {
         } catch { $null = $_ }
     }
     $headers = @{ Authorization = "Bearer $Token"; 'User-Agent' = 'rust-click-build'; Accept = 'application/vnd.github+json' }
-    $resp = Invoke-RestMethod -Uri $script:RtkApiTagsUrl -Headers $headers -TimeoutSec 30 -ErrorAction Stop
-    return @($resp | ForEach-Object { [PSCustomObject]@{ Name = $_.name; Sha = $_.commit.sha } })
+    $uri = $script:RtkApiTagsUrl + '&page=' + $Page
+    $resp = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30 -ErrorAction Stop
+    return @($resp | ForEach-Object { if ($null -ne $_) { [PSCustomObject]@{ Name = $_.name; Sha = $_.commit.sha } } })
+}
+
+<#
+.SYNOPSIS
+    Lists rtk tag names from the GitHub API using GH_TOKEN, following the
+    pages (100 per page) until a short page or 20 pages. An error on a later
+    page keeps what was read; an error on the first page is thrown.
+    Mocked in tests.
+#>
+function Invoke-RtkTagApi {
+    param([string]$Token)
+    $all = New-Object System.Collections.Generic.List[object]
+    for ($page = 1; $page -le 20; $page++) {
+        $items = @()
+        try {
+            $items = @(Invoke-RtkTagApiPage -Token $Token -Page $page)
+        } catch {
+            if ($all.Count -eq 0) { throw }
+            break
+        }
+        foreach ($it in $items) { if ($null -ne $it) { $all.Add($it) } }
+        if ($items.Count -lt 100) { break }
+    }
+    return $all.ToArray()
 }
 
 <#
@@ -742,28 +1197,49 @@ function ConvertFrom-LsRemoteTag {
     network is asked once and not once per project.
 #>
 function Get-RtkLatestRelease {
-    param([string]$RepoUrl = $script:RtkDefaultRepoUrl)
+    param([string]$RepoUrl = $script:RtkDefaultRepoUrl, [string[]]$AlternateUrls = @())
     if ([string]::IsNullOrEmpty($RepoUrl)) { $RepoUrl = $script:RtkDefaultRepoUrl }
     if ($null -eq $script:RtkLatestCache) { $script:RtkLatestCache = @{} }
-    if ($script:RtkLatestCache.ContainsKey($RepoUrl)) { return $script:RtkLatestCache[$RepoUrl] }
+    # The https form is asked first (fast, uses the credential helper); the
+    # cache is keyed on it so every spelling of the rtk URL shares one entry.
+    $primary = ConvertTo-RtkHttpsUrl $RepoUrl
+    if ($null -eq $primary) { $primary = $RepoUrl }
+    if ($script:RtkLatestCache.ContainsKey($primary)) { return $script:RtkLatestCache[$primary] }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add($primary)
+    foreach ($u in (@($RepoUrl) + @($AlternateUrls))) {
+        if ([string]::IsNullOrEmpty($u)) { continue }
+        $u = ([string]$u).Trim()
+        if ($u.Length -eq 0 -or $candidates.Contains($u)) { continue }
+        $candidates.Add($u)
+    }
 
     $errors = New-Object System.Collections.Generic.List[string]
     $result = $null
-    try {
-        $ls = Invoke-RtkLsRemote -RepoUrl $RepoUrl
-        if ($null -ne $ls -and $ls.ExitCode -eq 0) {
-            $map = ConvertFrom-LsRemoteTag ([string]$ls.StdOut)
-            $latest = Select-RtkLatestTag @($map.Keys)
-            if ($null -ne $latest) {
-                $result = [PSCustomObject]@{ Tag = $latest; Sha = $map[$latest]; Source = 'git ls-remote'; TagShas = $map; Error = $null }
-            } else { $errors.Add('git ls-remote returned no release tags') }
-        } elseif ($null -eq $ls) {
-            $errors.Add('git ls-remote returned nothing')
-        } else {
-            $msg = (([string]$ls.StdErr) -split "`r?`n" | Where-Object { $_ -ne '' } | Select-Object -First 2) -join ' '
-            $errors.Add("git ls-remote failed (exit $($ls.ExitCode)): $msg")
-        }
-    } catch { $errors.Add("git ls-remote error: $($_.Exception.Message)") }
+    $urlIndex = 0
+    foreach ($url in $candidates) {
+        $urlIndex++
+        # The URL itself is not logged (it may carry userinfo).
+        $suffix = ''
+        if ($urlIndex -gt 1) { $suffix = " (manifest URL #$($urlIndex - 1))" }
+        try {
+            $ls = Invoke-RtkLsRemote -RepoUrl $url -TimeoutSec 15
+            if ($null -ne $ls -and $ls.ExitCode -eq 0) {
+                $map = ConvertFrom-LsRemoteTag ([string]$ls.StdOut)
+                $latest = Select-RtkLatestTag @($map.Keys)
+                if ($null -ne $latest) {
+                    $result = [PSCustomObject]@{ Tag = $latest; Sha = $map[$latest]; Source = 'git ls-remote'; TagShas = $map; Error = $null }
+                } else { $errors.Add('git ls-remote returned no release tags' + $suffix) }
+            } elseif ($null -eq $ls) {
+                $errors.Add('git ls-remote returned nothing' + $suffix)
+            } else {
+                $msg = (([string]$ls.StdErr) -split "`r?`n" | Where-Object { $_ -ne '' } | Select-Object -First 2) -join ' '
+                $errors.Add("git ls-remote failed (exit $($ls.ExitCode)): $msg" + $suffix)
+            }
+        } catch { $errors.Add("git ls-remote error: $($_.Exception.Message)" + $suffix) }
+        if ($null -ne $result) { break }
+    }
 
     if ($null -eq $result) {
         $token = $env:GH_TOKEN
@@ -788,7 +1264,7 @@ function Get-RtkLatestRelease {
     if ($null -eq $result) {
         $result = [PSCustomObject]@{ Tag = $null; Sha = $null; Source = $null; TagShas = @{}; Error = ($errors -join '; ') }
     }
-    $script:RtkLatestCache[$RepoUrl] = $result
+    $script:RtkLatestCache[$primary] = $result
     return $result
 }
 
@@ -810,11 +1286,11 @@ function New-RtkBackupDirectory {
     $base = [System.IO.Path]::Combine($rootFull, ("rtk-backup-$stamp-" + (ConvertTo-RcbSafeFileName $ProjectName)))
     $dir = $base
     $n = 1
-    while ([System.IO.Directory]::Exists($dir) -or [System.IO.File]::Exists($dir)) {
+    while ([System.IO.Directory]::Exists((ConvertTo-RcbLongPath $dir)) -or [System.IO.File]::Exists((ConvertTo-RcbLongPath $dir))) {
         $n++
         $dir = "$base-$n"
     }
-    [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+    [System.IO.Directory]::CreateDirectory((ConvertTo-RcbLongPath $dir)) | Out-Null
     return $dir
 }
 
@@ -828,14 +1304,16 @@ function Backup-RtkFile {
     param([string[]]$Files, [string]$BackupDir)
     $pairs = New-Object System.Collections.Generic.List[PSCustomObject]
     $dirFull = Resolve-RcbFullPath $BackupDir
-    [System.IO.Directory]::CreateDirectory($dirFull) | Out-Null
+    [System.IO.Directory]::CreateDirectory((ConvertTo-RcbLongPath $dirFull)) | Out-Null
     $n = 0
     foreach ($f in ($Files | Where-Object { -not [string]::IsNullOrEmpty($_) } | Select-Object -Unique)) {
         $n++
         $src = Resolve-RcbFullPath $f
         $dest = [System.IO.Path]::Combine($dirFull, ("{0:D2}_{1}" -f $n, [System.IO.Path]::GetFileName($src)))
-        $existed = [System.IO.File]::Exists($src)
-        if ($existed) { [System.IO.File]::Copy($src, $dest, $true) }
+        # $dest stays un-prefixed in the returned pair; only the I/O calls get \\?\.
+        $srcIo = ConvertTo-RcbLongPath $src
+        $existed = [System.IO.File]::Exists($srcIo)
+        if ($existed) { [System.IO.File]::Copy($srcIo, (ConvertTo-RcbLongPath $dest), $true) }
         $pairs.Add([PSCustomObject]@{ Original = $f; Backup = $dest; Existed = $existed })
     }
     return ,$pairs.ToArray()
@@ -853,14 +1331,14 @@ function Restore-RtkBackup {
     foreach ($p in $Pairs) {
         if ($null -eq $p) { continue }
         try {
-            $orig = Resolve-RcbFullPath ([string]$p.Original)
+            $orig = ConvertTo-RcbLongPath (Resolve-RcbFullPath ([string]$p.Original))
             if ($p.Existed) {
-                [System.IO.File]::Copy([string]$p.Backup, $orig, $true)
+                [System.IO.File]::Copy((ConvertTo-RcbLongPath ([string]$p.Backup)), $orig, $true)
             } elseif ([System.IO.File]::Exists($orig)) {
                 [System.IO.File]::Delete($orig)
             }
         } catch {
-            $failures.Add("$($p.Original): $($_.Exception.Message)")
+            $failures.Add("$($p.Original): $(Get-RcbErrorText $_.Exception)")
         }
     }
     if ($failures.Count -gt 0) { throw ("Could not restore: " + ($failures.ToArray() -join '; ')) }
@@ -898,7 +1376,8 @@ function Invoke-RtkUpdateCheck {
     if ($deps.Count -eq 0) { $res.Status = 'no rtk dep'; return $res }
     $res.HasRtk = $true
 
-    $latest = Get-RtkLatestRelease -RepoUrl $deps[0].GitUrl
+    $depUrls = @($deps | ForEach-Object { [string]$_.GitUrl } | Where-Object { -not [string]::IsNullOrEmpty($_) } | Select-Object -Unique)
+    $latest = Get-RtkLatestRelease -RepoUrl $deps[0].GitUrl -AlternateUrls $depUrls
     $res.Latest = $latest.Tag
     if ($null -eq $latest.Tag) {
         & $say '' 'warning'
@@ -971,10 +1450,11 @@ function Invoke-RtkUpdateCheck {
         $files = @($toBump | ForEach-Object { $_.ManifestPath }) + @([System.IO.Path]::Combine($projDir, 'Cargo.lock'))
         $res.Backup = Backup-RtkFile -Files $files -BackupDir $backupDir
     } catch {
-        & $say "  rtk: could not back up Cargo.toml/Cargo.lock: $($_.Exception.Message). Not updating; building with the current pins." 'warning'
+        $why = Get-RcbErrorText $_.Exception
+        & $say "  rtk: could not back up Cargo.toml/Cargo.lock: $why. Not updating; building with the current pins." 'warning'
         $res.Backup = @()
         $res.Status = 'update skipped (backup failed); kept old pins'
-        $res.Warnings = @($_.Exception.Message)
+        $res.Warnings = @($why)
         return $res
     }
     & $say "  rtk: backed up Cargo.toml/Cargo.lock to $backupDir" 'muted'
@@ -998,10 +1478,11 @@ function Invoke-RtkUpdateCheck {
         }
     } catch {
         # Some manifests may already be rewritten: put all of them back.
-        & $say "  rtk: could not rewrite the pin: $($_.Exception.Message). Restoring backup." 'danger'
+        $why = Get-RcbErrorText $_.Exception
+        & $say "  rtk: could not rewrite the pin: $why. Restoring backup." 'danger'
         & $rollback
         $res.Status = 'update failed (pin rewrite); kept old pin'
-        $res.Warnings = @($_.Exception.Message)
+        $res.Warnings = @($why)
         return $res
     }
 

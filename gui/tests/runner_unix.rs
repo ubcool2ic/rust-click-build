@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rcb_gui::protocol::{Event, Line, Role};
-use rcb_gui::runner::{self, BuildRequest, Profile, Runner, RunnerMsg, Sink};
+use rcb_gui::runner::{self, BuildRequest, CommandSpec, Profile, Runner, RunnerMsg, Sink};
 use rtk::Tk;
 
 const SCRIPT: &str = r#"#!/bin/sh
@@ -20,6 +20,85 @@ echo "@@RCB {\"event\":\"log\",\"text\":\"answer=$answer\",\"role\":\"info\"}"
 echo '@@RCB {"event":"summary","success":true,"cancelled":false,"exit_code":0,"built_dir":"/tmp/x/_built","log_file":"/tmp/x/log.txt","passed":1,"failed":0}'
 exit 0
 "#;
+
+type Collected = Arc<Mutex<Vec<RunnerMsg>>>;
+
+fn collecting_sink() -> (Collected, Sink) {
+    let collected: Collected = Arc::new(Mutex::new(Vec::new()));
+    let store = Arc::clone(&collected);
+    let sink: Sink = Arc::new(move |_tk: &mut Tk, msg: RunnerMsg| {
+        if let Ok(mut items) = store.lock() {
+            items.push(msg);
+        }
+    });
+    (collected, sink)
+}
+
+fn wait_until(tk: &mut Tk, collected: &Collected, secs: u64, pred: impl Fn(&RunnerMsg) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        tk.process_posted();
+        let snapshot = collected.lock().expect("lock").clone();
+        if snapshot.iter().any(&pred) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out: {snapshot:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn sh(script: &str) -> CommandSpec {
+    CommandSpec {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+    }
+}
+
+#[test]
+fn cancel_kills_the_tree_and_finishes_promptly() {
+    let mut tk = Tk::new();
+    let (collected, sink) = collecting_sink();
+    // The background sleep inherits stdout/stderr and outlives the shell.
+    let spec = sh("echo started; sleep 30 & wait");
+    let runner = Runner::spawn(&spec, tk.proxy(), sink).expect("spawn sh");
+    wait_until(&mut tk, &collected, 20, |m| {
+        matches!(m, RunnerMsg::Line(Line::Text(t)) if t == "started")
+    });
+    runner.cancel();
+    runner.cancel();
+    wait_until(&mut tk, &collected, 15, |m| matches!(m, RunnerMsg::Exited(_)));
+    assert!(runner.is_finished());
+    // Cancel and prompt answers after the end are harmless.
+    runner.cancel();
+    runner.answer(true);
+    runner.answer(false);
+    runner.join();
+}
+
+#[test]
+fn exit_is_reported_even_if_a_grandchild_keeps_the_pipes_open() {
+    let mut tk = Tk::new();
+    let (collected, sink) = collecting_sink();
+    let spec = sh("echo done; sleep 20 & exit 0");
+    let runner = Runner::spawn(&spec, tk.proxy(), sink).expect("spawn sh");
+    wait_until(&mut tk, &collected, 12, |m| matches!(m, RunnerMsg::Exited(_)));
+    assert!(runner.is_finished());
+    let all = collected.lock().expect("lock").clone();
+    assert_eq!(all.last(), Some(&RunnerMsg::Exited(Some(0))));
+    assert!(all.contains(&RunnerMsg::Line(Line::Text("done".into()))));
+    runner.join();
+}
+
+#[test]
+fn spawn_failure_is_an_error_not_a_panic() {
+    let tk = Tk::new();
+    let (_collected, sink) = collecting_sink();
+    let spec = CommandSpec {
+        program: "/nonexistent/rcb-gui-no-such-shell".into(),
+        args: vec!["-File".into(), "build.ps1".into()],
+    };
+    assert!(Runner::spawn(&spec, tk.proxy(), sink).is_err());
+}
 
 #[test]
 fn delivers_events_in_order_and_answers_prompt() {

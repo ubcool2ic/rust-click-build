@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rtk::{Tk, TkProxy};
 
@@ -16,6 +16,14 @@ use crate::protocol::{parse_line, Line};
 /// `CREATE_NO_WINDOW` process creation flag.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Longest piece of output (in bytes) delivered as one line; longer lines
+/// are split so a child that never prints a newline cannot exhaust memory.
+const MAX_LINE_BYTES: usize = 256 * 1024;
+
+/// How long the output readers may keep draining after the child itself has
+/// exited. A grandchild that inherited the pipes can hold them open forever.
+const READER_GRACE: Duration = Duration::from_secs(3);
 
 /// Cargo build profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,7 +179,11 @@ fn pump<R: Read>(reader: R, mut on_line: impl FnMut(String)) {
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        match reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64)
+            .read_until(b'\n', &mut buf)
+        {
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 let text = String::from_utf8_lossy(&buf);
@@ -181,12 +193,15 @@ fn pump<R: Read>(reader: R, mut on_line: impl FnMut(String)) {
     }
 }
 
+/// Kills the child's process tree. With `wait` the kill has completed when
+/// this returns (used on drop, where the process may exit right afterwards);
+/// otherwise it runs in the background so the UI thread is not blocked.
 #[cfg(windows)]
-fn kill_tree(pid: u32, child: &Arc<Mutex<Child>>) {
+fn kill_tree(pid: u32, child: &Arc<Mutex<Child>>, wait: bool) {
     use std::os::windows::process::CommandExt;
     let spec = kill_tree_command(pid);
     let child = Arc::clone(child);
-    thread::spawn(move || {
+    let kill = move || {
         let ok = Command::new(&spec.program)
             .args(&spec.args)
             .creation_flags(CREATE_NO_WINDOW)
@@ -199,12 +214,39 @@ fn kill_tree(pid: u32, child: &Arc<Mutex<Child>>) {
         if !ok {
             let _ = lock(&child).kill();
         }
-    });
+    };
+    if wait {
+        kill();
+    } else {
+        thread::spawn(kill);
+    }
 }
 
+/// Kills the child and, on Unix, the process group it leads (the child is
+/// started in its own group), so grandchildren such as cargo die as well.
 #[cfg(not(windows))]
-fn kill_tree(_pid: u32, child: &Arc<Mutex<Child>>) {
+fn kill_tree(pid: u32, child: &Arc<Mutex<Child>>, wait: bool) {
     let _ = lock(child).kill();
+    #[cfg(unix)]
+    {
+        let group = move || {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg("--")
+                .arg(format!("-{pid}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        };
+        if wait {
+            group();
+        } else {
+            thread::spawn(group);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (pid, wait);
 }
 
 /// A running `build.ps1` child with its IO threads.
@@ -213,6 +255,8 @@ pub struct Runner {
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     done: Arc<AtomicBool>,
+    /// Set once nothing more may be posted to the UI thread.
+    quiet: Arc<AtomicBool>,
     waiter: Option<JoinHandle<()>>,
 }
 
@@ -230,6 +274,12 @@ impl Runner {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Own process group, so cancel can kill the whole tree.
+            cmd.process_group(0);
+        }
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -237,38 +287,60 @@ impl Runner {
         let pid = child.id();
         let child = Arc::new(Mutex::new(child));
         let done = Arc::new(AtomicBool::new(false));
+        let quiet = Arc::new(AtomicBool::new(false));
 
         let out_thread = stdout.map(|stream| {
-            let (p, k) = (proxy.clone(), Arc::clone(&sink));
+            let (p, k, q) = (proxy.clone(), Arc::clone(&sink), Arc::clone(&quiet));
             thread::spawn(move || {
                 pump(stream, |line| {
-                    post(&p, &k, RunnerMsg::Line(parse_line(&line)));
+                    if !q.load(Ordering::SeqCst) {
+                        post(&p, &k, RunnerMsg::Line(parse_line(&line)));
+                    }
                 });
             })
         });
         let err_thread = stderr.map(|stream| {
-            let (p, k) = (proxy.clone(), Arc::clone(&sink));
+            let (p, k, q) = (proxy.clone(), Arc::clone(&sink), Arc::clone(&quiet));
             thread::spawn(move || {
-                pump(stream, |line| post(&p, &k, RunnerMsg::Stderr(line)));
+                pump(stream, |line| {
+                    if !q.load(Ordering::SeqCst) {
+                        post(&p, &k, RunnerMsg::Stderr(line));
+                    }
+                });
             })
         });
 
         let child_w = Arc::clone(&child);
         let done_w = Arc::clone(&done);
+        let quiet_w = Arc::clone(&quiet);
         let waiter = thread::spawn(move || {
-            for handle in [out_thread, err_thread].into_iter().flatten() {
-                let _ = handle.join();
-            }
+            // Reap the child first: the readers may never see EOF when a
+            // grandchild inherited the pipes and outlives the child.
             let code = loop {
                 let polled = lock(&child_w).try_wait();
                 match polled {
                     Ok(Some(status)) => break status.code(),
-                    Ok(None) => thread::sleep(Duration::from_millis(40)),
+                    Ok(None) => thread::sleep(Duration::from_millis(20)),
                     Err(_) => break None,
                 }
             };
+            let readers: Vec<JoinHandle<()>> =
+                [out_thread, err_thread].into_iter().flatten().collect();
+            let deadline = Instant::now() + READER_GRACE;
+            while Instant::now() < deadline && !readers.iter().all(|h| h.is_finished()) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Readers that are still blocked are detached and muted.
+            let dropped = quiet_w.swap(true, Ordering::SeqCst);
+            for handle in readers {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                }
+            }
             done_w.store(true, Ordering::SeqCst);
-            post(&proxy, &sink, RunnerMsg::Exited(code));
+            if !dropped {
+                post(&proxy, &sink, RunnerMsg::Exited(code));
+            }
         });
 
         Ok(Runner {
@@ -276,6 +348,7 @@ impl Runner {
             child,
             stdin: Arc::new(Mutex::new(stdin)),
             done,
+            quiet,
             waiter: Some(waiter),
         })
     }
@@ -310,7 +383,7 @@ impl Runner {
         }
         // Closing stdin unblocks a child waiting on a prompt.
         *lock(&self.stdin) = None;
-        kill_tree(self.pid, &self.child);
+        kill_tree(self.pid, &self.child, false);
     }
 
     /// Waits for the bookkeeping thread. Call after [`RunnerMsg::Exited`].
@@ -323,7 +396,15 @@ impl Runner {
 
 impl Drop for Runner {
     fn drop(&mut self) {
-        self.cancel();
+        // The owner is gone: nothing may be posted to the UI thread any more.
+        self.quiet.store(true, Ordering::SeqCst);
+        if self.is_finished() {
+            return;
+        }
+        *lock(&self.stdin) = None;
+        // Synchronous: the process may exit right after this drop, which
+        // would abandon a background kill before it ran.
+        kill_tree(self.pid, &self.child, true);
     }
 }
 
@@ -409,6 +490,14 @@ mod tests {
         assert_eq!(Profile::parse("Release"), Some(Profile::Release));
         assert_eq!(Profile::parse("DEBUG"), Some(Profile::Debug));
         assert_eq!(Profile::parse("fast"), None);
+    }
+
+    #[test]
+    fn pump_splits_overlong_lines() {
+        let data = vec![b'a'; MAX_LINE_BYTES * 2 + 10];
+        let mut lens = Vec::new();
+        pump(data.as_slice(), |line| lens.push(line.len()));
+        assert_eq!(lens, vec![MAX_LINE_BYTES, MAX_LINE_BYTES, 10]);
     }
 
     #[test]

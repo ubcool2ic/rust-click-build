@@ -24,6 +24,8 @@ struct App {
     state: BuildState,
     runner: Option<Runner>,
     script: Option<PathBuf>,
+    /// The current child asked a question that has not been answered yet.
+    prompt_pending: bool,
 }
 
 /// Observer of every runner message (test hook).
@@ -182,10 +184,34 @@ fn open_folder(dir: &Path) {
     }
 }
 
+/// Makes `path` absolute without touching the file system, so a relative
+/// name such as `-Test` can never be read as a PowerShell parameter.
+fn absolute_path(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+/// Delivers the yes/no dialog's answer to the current child. Answers to a
+/// prompt of a child that has since exited or been replaced are dropped.
+fn answer_pending_prompt(yes: bool) -> bool {
+    with_app(|app| {
+        if !std::mem::take(&mut app.prompt_pending) {
+            return false;
+        }
+        match &app.runner {
+            Some(runner) => {
+                runner.answer(yes);
+                true
+            }
+            None => false,
+        }
+    })
+    .unwrap_or(false)
+}
+
 impl App {
     /// Validates the inputs and starts `build.ps1`.
     fn start(&mut self, tk: &mut Tk) {
-        if self.state.is_running() {
+        if self.state.is_running() || self.runner.is_some() {
             return;
         }
         let folder = tk.entry_get(self.ui.folder_entry).unwrap_or_default();
@@ -203,11 +229,12 @@ impl App {
             ui::set_error(tk, &self.ui, Some("That folder does not exist."));
             return;
         }
+        let path = absolute_path(path);
         if self.script.is_none() {
             self.script = args::find_script(None);
         }
         let script = match &self.script {
-            Some(script) if script.is_file() => script.clone(),
+            Some(script) if script.is_file() => absolute_path(script.clone()),
             _ => {
                 ui::set_error(
                     tk,
@@ -234,6 +261,7 @@ impl App {
             Ok(runner) => {
                 self.state.begin();
                 self.runner = Some(runner);
+                self.prompt_pending = false;
                 ui::set_error(tk, &self.ui, None);
             }
             Err(err) => {
@@ -273,12 +301,14 @@ fn on_runner_msg(tk: &mut Tk, msg: RunnerMsg) {
             RunnerMsg::Line(line) => {
                 if let Line::Event(Event::Prompt { question, .. }) = &line {
                     prompt = Some(question.clone());
+                    app.prompt_pending = true;
                 }
                 app.state.apply_line(line);
             }
             RunnerMsg::Stderr(text) => app.state.push_log(Role::Muted, text),
             RunnerMsg::Exited(code) => {
                 app.state.child_exited(code);
+                app.prompt_pending = false;
                 if let Some(runner) = app.runner.take() {
                     runner.join();
                 }
@@ -289,11 +319,7 @@ fn on_runner_msg(tk: &mut Tk, msg: RunnerMsg) {
     });
     if let Some(question) = prompt {
         dialog::ask_yes_no(tk, "Rust Click Build", &question, |_tk, yes| {
-            with_app(|app| {
-                if let Some(runner) = &app.runner {
-                    runner.answer(yes);
-                }
-            });
+            answer_pending_prompt(yes);
         });
     }
     match finished {
@@ -388,6 +414,7 @@ pub fn setup(tk: &mut Tk, args: &Args) -> Result<(), Box<dyn Error>> {
         state: BuildState::new(),
         runner: None,
         script: args::find_script(args.script.as_deref()),
+        prompt_pending: false,
     };
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::new(RefCell::new(app))));
 
@@ -489,6 +516,19 @@ pub fn has_runner() -> bool {
     with_app(|app| app.runner.is_some()).unwrap_or(false)
 }
 
+/// Answers a pending script prompt the way the yes/no dialog would.
+/// Returns `false` when no child process is attached.
+pub fn answer_prompt(yes: bool) -> bool {
+    with_app(|app| match &app.runner {
+        Some(runner) => {
+            runner.answer(yes);
+            true
+        }
+        None => false,
+    })
+    .unwrap_or(false)
+}
+
 /// Switches the theme through the selector variable and the same handler
 /// the theme combobox triggers.
 pub fn select_theme(tk: &mut Tk, choice: ThemeChoice) {
@@ -521,6 +561,45 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rcb-gui-drop-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    #[test]
+    fn absolute_path_never_looks_like_a_switch() {
+        let abs = absolute_path(PathBuf::from("-Test"));
+        assert!(abs.is_absolute());
+        assert!(!abs.to_string_lossy().starts_with('-'));
+        // An empty path cannot be made absolute and is returned unchanged.
+        assert_eq!(absolute_path(PathBuf::new()), PathBuf::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_prompt_answers_are_dropped() {
+        let args = match args::parse(std::iter::empty::<OsString>()) {
+            Ok(args) => args,
+            Err(_) => panic!("empty argument list must parse"),
+        };
+        let mut tk = Tk::new();
+        setup(&mut tk, &args).expect("setup");
+
+        let spec = runner::CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "read answer".into()],
+        };
+        let sink: Sink = Arc::new(|_tk: &mut Tk, _msg: RunnerMsg| {});
+        let child = Runner::spawn(&spec, tk.proxy(), sink).expect("spawn sh");
+        with_app(|app| {
+            app.runner = Some(child);
+            app.prompt_pending = false;
+        });
+        // A dialog left over from an earlier run must not answer this child.
+        assert!(!answer_pending_prompt(true));
+        with_app(|app| app.prompt_pending = true);
+        assert!(answer_pending_prompt(true));
+        // Each prompt is answered at most once.
+        assert!(!answer_pending_prompt(true));
+
+        teardown();
     }
 
     #[test]

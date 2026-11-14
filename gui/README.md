@@ -28,7 +28,7 @@ upward from the executable and the current directory), `--path <folder>`,
 `--profile release|debug`, `--theme System|Light|Dark|HighContrast`, `--test`,
 `--no-rtk-update`, `--screenshot-dir <dir>`.
 
-Keyboard: `Ctrl+Enter` / `F5` start, `Esc` cancel.
+Keyboard: `Ctrl+Enter` / `F5` start, `Esc` cancel. The build log is monospace and scrollable with the mouse wheel. It keeps the last 2000 lines and stays pinned to the bottom unless you scroll up.
 
 If the folder picker call ever stops compiling against a newer rtk, build with
 `--no-default-features` (the Browse button then uses a text prompt).

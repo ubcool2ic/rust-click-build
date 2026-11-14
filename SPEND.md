@@ -13,8 +13,14 @@
 | 2026-11-14 | anthropic/claude-fable-5.2 | build.ps1: -JsonProgress, -Gui launcher, -ClassicGui, perf, BuildGUI.bat, tests/JsonProgress.Tests.ps1 | $1.6334 |
 | 2026-11-14 | anthropic/claude-fable-5.2 | GUI: drag-and-drop, setup/test hooks, end-to-end test against the real build.ps1 | $1.0666 |
 | 2026-11-14 | anthropic/claude-fable-5.2 | GUI: Browse starts in typed folder + MockFileDialog test. Hit max_tokens; only app.rs kept | $0.6719 |
+| 2026-11-14 | anthropic/claude-fable-5.2 | rtk updater: https-first tag lookup with 15 s timeout, API pagination, long-path helper + tests (reply cut off inside NOTES only; all code applied) | $1.4757 |
+| 2026-11-14 | anthropic/claude-fable-5.2 | build.ps1: Add-CargoBinToPath for -Gui, per-line log flush, Invoke-InSTA relaunch, classic window handler fixes + tests | $1.4836 |
+| 2026-11-14 | anthropic/claude-fable-5.2 | GUI: monospace log with scrollback, end-to-end rtk tag bump test | $0.9826 |
+| 2026-11-14 | anthropic/claude-fable-5.2 | rtk updater: multi-line TOML, workspace members/exclude + tests | $1.6529 |
+| 2026-11-14 | anthropic/claude-fable-5.2 | GUI crash/bug sweep (runner, protocol, state, app) + tests | $1.6909 |
+| 2026-11-14 | anthropic/claude-fable-5.2 | PowerShell crash/bug sweep (build.ps1, RcbProgress.ps1) + tests | $1.4937 |
 
-**Total: $20.5071**
+**Total: $29.2865**
 
 ### Hand edits (2026-11-14, Fable 5.2 round)
 These were made by hand, not by Fable:
@@ -25,3 +31,8 @@ These were made by hand, not by Fable:
 - `build.ps1`: lint-only fixes. Approved names (`Update-SessionPath`, `Test-BuildPrerequisite`, `Find-CargoProject`) with aliases for the old names, `$null = $_` in empty catch blocks, and two unused variables removed.
 - `tests/JsonProgress.Tests.ps1`: a helper renamed to a singular noun.
 - README, SPEND, `.gitignore` and `docs/` were edited by hand.
+
+### Hand edits (2026-11-14, bug-fix round)
+- `build.ps1`: `ConvertTo-RcbRelaunchArgument` returned a nested array (`return ,$list.ToArray()`). Changed to a plain return, with the caller wrapping it in `@()`.
+- `tests/Fixes2.Sweep.Tests.ps1`: a case-insensitive `-Match '"Count":'` also matched the protocol's own `"count":`. Changed to `-MatchExactly`.
+- Screenshots in `docs/screenshots/` regenerated.

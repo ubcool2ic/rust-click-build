@@ -5,6 +5,10 @@ use serde_json::Value;
 /// Prefix marking a machine-readable stdout line.
 pub const PREFIX: &str = "@@RCB";
 
+/// Upper bound for durations accepted from the child (keeps the formatted
+/// table cell short even for absurd values).
+const MAX_SECONDS: f64 = 1.0e9;
+
 /// Visual role of a log line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -188,6 +192,7 @@ fn f(v: &Value, key: &str) -> f64 {
     v.get(key)
         .and_then(Value::as_f64)
         .filter(|x| x.is_finite())
+        .map(|x| x.clamp(0.0, MAX_SECONDS))
         .unwrap_or(0.0)
 }
 
@@ -437,6 +442,21 @@ mod tests {
                 role: Role::Text
             }
         );
+    }
+
+    #[test]
+    fn hostile_seconds_are_clamped() {
+        let secs = |raw: &str| {
+            let json = format!(r#"{{"event":"project_end","index":1,"seconds":{raw}}}"#);
+            match ev(&json) {
+                Event::ProjectEnd { seconds, .. } => seconds,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(secs("-5"), 0.0);
+        assert_eq!(secs("1e300"), MAX_SECONDS);
+        assert_eq!(secs("\"soon\""), 0.0);
+        assert_eq!(secs("1.5"), 1.5);
     }
 
     #[test]

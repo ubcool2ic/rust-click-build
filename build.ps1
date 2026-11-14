@@ -46,6 +46,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Bound script parameters, kept for the STA relaunch (see Invoke-InSTA).
+$script:RcbBoundParameters = @{}
+foreach ($rcbKey in @($PSBoundParameters.Keys)) { $script:RcbBoundParameters[$rcbKey] = $PSBoundParameters[$rcbKey] }
+
 # rtk design tokens (console + GUI colours) and the forced rtk update check.
 . (Join-Path $PSScriptRoot (Join-Path 'lib' 'RtkTheme.ps1'))
 . (Join-Path $PSScriptRoot (Join-Path 'lib' 'RtkUpdate.ps1'))
@@ -72,32 +76,116 @@ Set-Alias -Name Find-CargoProjects -Value Find-CargoProject
 # -------------------------------------------------------------------------
 # Helper: STA Thread Runner (required for WinForms dialogs on pwsh Core)
 # -------------------------------------------------------------------------
+function Test-RcbStaThread {
+    return ([System.Threading.Thread]::CurrentThread.GetApartmentState() -eq [System.Threading.ApartmentState]::STA)
+}
+
+<#
+.SYNOPSIS
+    Path of the PowerShell host running this script (powershell.exe or pwsh).
+#>
+function Get-RcbHostExecutable {
+    $exe = $null
+    try { $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { $exe = $null }
+    if (-not [string]::IsNullOrEmpty($exe)) {
+        $leaf = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+        if ($leaf -match '^(powershell|pwsh)$') { return $exe }
+    }
+    if ($PSVersionTable.PSVersion.Major -le 5) { return 'powershell.exe' }
+    if ($script:IsWindowsOS) { return 'pwsh.exe' }
+    return 'pwsh'
+}
+
+<#
+.SYNOPSIS
+    Pure builder for the host argument list that re-runs this script with the
+    same bound parameters. Present switches become -Name, absent ones are
+    dropped, other values become "-Name", "value" (one argument each).
+    -STA is added when the host is a Windows executable (*.exe).
+#>
+function ConvertTo-RcbRelaunchArgument {
+    param(
+        [hashtable]$BoundParameters,
+        [string]$ScriptPath,
+        [string[]]$Extra = @(),
+        [string]$HostPath = 'powershell.exe'
+    )
+    $list = New-Object System.Collections.Generic.List[string]
+    $list.Add('-NoProfile')
+    if ($HostPath -match '\.exe$') { $list.Add('-STA') }
+    $list.Add('-File')
+    $list.Add($ScriptPath)
+    if ($null -ne $BoundParameters) {
+        foreach ($name in @($BoundParameters.Keys | Sort-Object)) {
+            $value = $BoundParameters[$name]
+            if ($null -eq $value) { continue }
+            if ($value -is [System.Management.Automation.SwitchParameter]) {
+                if ($value.IsPresent) { $list.Add('-' + [string]$name) }
+                continue
+            }
+            if ($value -is [bool]) {
+                if ($value) { $list.Add('-' + [string]$name) }
+                continue
+            }
+            $text = [string]$value
+            if ($text -eq '') { continue }
+            $list.Add('-' + [string]$name)
+            $list.Add($text)
+        }
+    }
+    foreach ($e in @($Extra)) {
+        if (-not [string]::IsNullOrEmpty($e)) { $list.Add($e) }
+    }
+    return $list.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Re-runs this script in a child PowerShell process started with -STA,
+    waits for it and returns its exit code.
+#>
+function Invoke-RcbStaRelaunch {
+    param(
+        [hashtable]$BoundParameters = $script:RcbBoundParameters,
+        [string]$ScriptPath = $PSCommandPath,
+        [string[]]$Extra = @()
+    )
+    if ($env:RCB_STA_CHILD -eq '1') {
+        throw "An STA thread is required for the window, and the relaunched process is still not STA."
+    }
+    if ([string]::IsNullOrEmpty($ScriptPath)) {
+        throw "An STA thread is required for the window, and the script path for a relaunch is unknown."
+    }
+    $hostExe = Get-RcbHostExecutable
+    $argList = @(ConvertTo-RcbRelaunchArgument -BoundParameters $BoundParameters -ScriptPath $ScriptPath -Extra $Extra -HostPath $hostExe)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $hostExe
+    $null = Set-RcbProcessArgument -StartInfo $psi -ArgumentList $argList
+    $psi.UseShellExecute = $false
+    $psi.EnvironmentVariables['RCB_STA_CHILD'] = '1'
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    try {
+        [void]$proc.Start()
+        $proc.WaitForExit()
+        return [int]$proc.ExitCode
+    } finally {
+        try { $proc.Dispose() } catch { $null = $_ }
+    }
+}
+
+# Already STA: runs the scriptblock inline and returns its output.
+# Otherwise: re-runs this script in a -STA child process and returns its exit code
+# (a raw .NET thread has no runspace, so script cannot run on it).
 function Invoke-InSTA {
-    param([scriptblock]$ScriptBlock)
-    $currentApartment = [System.Threading.Thread]::CurrentThread.GetApartmentState()
-    if ($currentApartment -eq [System.Threading.ApartmentState]::STA) {
+    param([scriptblock]$ScriptBlock, [string[]]$Extra = @())
+    if (Test-RcbStaThread) {
         return (& $ScriptBlock)
     }
 
-    $thread = New-Object System.Threading.Thread([System.Threading.ThreadStart]{
-        try {
-            $script:staOutput = & $ScriptBlock
-        } catch {
-            $script:staError = $_
-        }
-    })
-    $thread.SetApartmentState([System.Threading.ApartmentState]::STA)
-    $thread.Start()
-    $thread.Join()
+    # Not STA: relaunch the whole script in an STA child process.
 
-    if ($null -ne $script:staError) {
-        $err = $script:staError
-        $script:staError = $null
-        throw $err
-    }
-    $res = $script:staOutput
-    $script:staOutput = $null
-    return $res
+    return (Invoke-RcbStaRelaunch -Extra $Extra)
 }
 
 # -------------------------------------------------------------------------
@@ -184,6 +272,57 @@ function Update-SessionPath {
 }
 
 # -------------------------------------------------------------------------
+# Cargo bin directory on PATH (rustup installs are often not on PATH yet)
+# -------------------------------------------------------------------------
+<#
+.SYNOPSIS
+    When cargo is not resolvable, puts CARGO_HOME\bin and <home>\.cargo\bin
+    (USERPROFILE on Windows, HOME elsewhere) at the front of PATH if the
+    directory exists and is not already listed. Returns $true when cargo is
+    resolvable afterwards.
+#>
+function Add-CargoBinToPath {
+    $sep = [string][System.IO.Path]::PathSeparator
+    $trimChars = [char[]]@('\', '/')
+    $dirs = New-Object System.Collections.Generic.List[string]
+    # Path.Combine, not Join-Path: Join-Path throws when the drive does not exist.
+    if (-not [string]::IsNullOrEmpty($env:CARGO_HOME)) {
+        try { $dirs.Add([System.IO.Path]::Combine($env:CARGO_HOME, 'bin')) } catch { $null = $_ }
+    }
+    $userHome = $null
+    if ($script:IsWindowsOS) { $userHome = $env:USERPROFILE } else { $userHome = $env:HOME }
+    if ([string]::IsNullOrEmpty($userHome)) { $userHome = $HOME }
+    if (-not [string]::IsNullOrEmpty($userHome)) {
+        try { $dirs.Add([System.IO.Path]::Combine($userHome, '.cargo', 'bin')) } catch { $null = $_ }
+    }
+
+    foreach ($dir in $dirs) {
+        # An already resolvable cargo is never shadowed.
+        if ($null -ne (Get-Command cargo -ErrorAction SilentlyContinue)) { break }
+        $exists = $false
+        try { $exists = [bool](Test-Path -LiteralPath $dir -PathType Container) } catch { $exists = $false }
+        if (-not $exists) { continue }
+        $want = $dir.TrimEnd($trimChars)
+        $comparison = [System.StringComparison]::Ordinal
+        if ($script:IsWindowsOS) { $comparison = [System.StringComparison]::OrdinalIgnoreCase }
+        $present = $false
+        foreach ($p in ([string]$env:PATH).Split([char[]]@([System.IO.Path]::PathSeparator))) {
+            if ([string]::IsNullOrEmpty($p)) { continue }
+            $have = $p.Trim().TrimEnd($trimChars)
+            if ([string]::Equals($have, $want, $comparison)) { $present = $true; break }
+        }
+        if (-not $present) {
+            if ([string]::IsNullOrEmpty($env:PATH)) {
+                $env:PATH = $dir
+            } else {
+                $env:PATH = $dir + $sep + $env:PATH
+            }
+        }
+    }
+    return ($null -ne (Get-Command cargo -ErrorAction SilentlyContinue))
+}
+
+# -------------------------------------------------------------------------
 # Process Runner with Live Output Interception
 # -------------------------------------------------------------------------
 function Invoke-ToolProcess {
@@ -240,6 +379,13 @@ function Invoke-ToolProcess {
         Lines    = $capturedLines.ToArray()
     }
     } finally {
+        # An exception (callback failure, stop request) must not leave the child running.
+        try {
+            if (-not $process.HasExited) {
+                $process.Kill()
+                [void]$process.WaitForExit(5000)
+            }
+        } catch { $null = $_ }
         try { $process.Dispose() } catch { $null = $_ }
     }
 }
@@ -255,20 +401,7 @@ function Test-BuildPrerequisite {
     )
 
     # 1. Cargo check & cargo/bin PATH check
-    $userHome = $env:USERPROFILE
-    if ([string]::IsNullOrEmpty($userHome)) {
-        $userHome = $env:HOME
-    }
-
-    if (-not [string]::IsNullOrEmpty($userHome)) {
-        $cargoBin = Join-Path $userHome (Join-Path ".cargo" "bin")
-        if ((Test-Path -LiteralPath $cargoBin) -and ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue))) {
-            $pathParts = $env:PATH -split [System.IO.Path]::PathSeparator
-            if (-not ($pathParts -contains $cargoBin)) {
-                $env:PATH = "$cargoBin" + [System.IO.Path]::PathSeparator + $env:PATH
-            }
-        }
-    }
+    $null = Add-CargoBinToPath
 
     $cargoCmd = Get-Command cargo -ErrorAction SilentlyContinue
 
@@ -282,7 +415,12 @@ function Test-BuildPrerequisite {
         $vswherePath = Join-Path $progFilesX86 (Join-Path "Microsoft Visual Studio" (Join-Path "Installer" "vswhere.exe"))
         $msvcFound = $false
         if (Test-Path -LiteralPath $vswherePath) {
-            $vsCheck = & $vswherePath -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            $vsCheck = $null
+            try {
+                $vsCheck = & $vswherePath -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            } catch {
+                $vsCheck = $null
+            }
             if (-not [string]::IsNullOrEmpty($vsCheck)) {
                 $msvcFound = $true
             }
@@ -322,6 +460,7 @@ function Test-BuildPrerequisite {
         $hasWinget = $true
     }
 
+    try {
     # Install Rust
     if ($needsCargo) {
         Write-BuildLog "Installing Rust toolchain..." -ForegroundColor Cyan -UiCallback $UiLog
@@ -331,7 +470,11 @@ function Test-BuildPrerequisite {
             if ($script:IsWindowsOS) {
                 $tempInit = Join-Path $env:TEMP "rustup-init.exe"
                 Write-BuildLog "Downloading rustup-init from https://win.rustup.rs/x86_64..." -ForegroundColor Cyan -UiCallback $UiLog
-                Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $tempInit
+                # Windows PowerShell 5.1: TLS 1.2 is not always on by default, and the IE engine may be missing.
+                try {
+                    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+                } catch { $null = $_ }
+                Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $tempInit -UseBasicParsing
                 & $tempInit -y | ForEach-Object { Write-BuildLog "  $_" -Role muted -UiCallback $UiLog }
             } else {
                 Write-BuildLog "Please install rustup manually: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" -ForegroundColor Red -UiCallback $UiLog
@@ -356,15 +499,13 @@ function Test-BuildPrerequisite {
 
     Update-SessionPath
 
-    if (-not [string]::IsNullOrEmpty($userHome)) {
-        $cargoBin = Join-Path $userHome (Join-Path ".cargo" "bin")
-        if ((Test-Path -LiteralPath $cargoBin) -and ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue))) {
-            $pathParts = $env:PATH -split [System.IO.Path]::PathSeparator
-            if (-not ($pathParts -contains $cargoBin)) {
-                $env:PATH = "$cargoBin" + [System.IO.Path]::PathSeparator + $env:PATH
-            }
-        }
+    } catch {
+        Write-BuildLog "Automatic installation failed: $($_.Exception.Message)" -ForegroundColor Red -UiCallback $UiLog
+        Update-SessionPath
     }
+
+    # Update-SessionPath rebuilt PATH from the registry; put cargo's bin dir back.
+    $null = Add-CargoBinToPath
 
     $recheckCargo = Get-Command cargo -ErrorAction SilentlyContinue
     if ($null -eq $recheckCargo) {
@@ -392,6 +533,35 @@ function Find-CargoProject {
     }
     $sorted = @($items | Sort-Object { ($_.DirectoryName -split '[\\/]').Count }, FullName)
     return ,([System.IO.FileInfo[]]$sorted)
+}
+
+<#
+.SYNOPSIS
+    target_directory from captured "cargo metadata" output lines. Cargo warnings
+    (stderr) are captured together with the JSON, so the last line starting
+    with "{" is tried first, then the whole text. Returns $null when not found.
+#>
+function Get-RcbMetadataTargetDir {
+    param([string[]]$Lines)
+    $all = @($Lines | Where-Object { $null -ne $_ })
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $jsonLine = $null
+    foreach ($l in $all) {
+        if ($l -match '^\s*\{') { $jsonLine = $l }
+    }
+    if ($null -ne $jsonLine) { $candidates.Add($jsonLine) }
+    if ($all.Count -gt 0) { $candidates.Add(($all -join "`n")) }
+    foreach ($text in $candidates) {
+        $obj = $null
+        try { $obj = $text | ConvertFrom-Json } catch { $obj = $null }
+        if ($null -eq $obj) { continue }
+        $prop = $null
+        try { $prop = $obj.PSObject.Properties['target_directory'] } catch { $prop = $null }
+        if ($null -ne $prop -and -not [string]::IsNullOrEmpty([string]$prop.Value)) {
+            return [string]$prop.Value
+        }
+    }
+    return $null
 }
 
 # -------------------------------------------------------------------------
@@ -535,7 +705,7 @@ function Start-BuildPipelineCore {
 
     try {
         # Check folder validity
-        if ([string]::IsNullOrEmpty($TargetFolder) -or -not (Test-Path -LiteralPath $TargetFolder)) {
+        if ([string]::IsNullOrEmpty($TargetFolder) -or -not (Test-Path -LiteralPath $TargetFolder -PathType Container)) {
             Write-BuildLog "Error: Invalid or non-existent folder specified: '$TargetFolder'" -ForegroundColor Red -UiCallback $UiLog
             return [PSCustomObject]@{ Success = $false; Cancelled = $true; Results = $summaryResults }
         }
@@ -618,11 +788,7 @@ function Start-BuildPipelineCore {
                 $metaArgs = @("metadata", "--format-version", "1", "--no-deps", "--manifest-path", $projManifestPath)
                 $metaProc = Invoke-ToolProcess -FilePath "cargo" -ArgumentList $metaArgs -WorkingDirectory $projDir
                 if ($metaProc.ExitCode -eq 0) {
-                    $jsonText = ($metaProc.Lines -join "`n")
-                    $metaObj = $jsonText | ConvertFrom-Json
-                    if ($null -ne $metaObj.target_directory) {
-                        $targetDir = $metaObj.target_directory
-                    }
+                    $targetDir = Get-RcbMetadataTargetDir -Lines $metaProc.Lines
                 }
             } catch {
                 # Fallback on target directory error
@@ -723,8 +889,12 @@ function Start-BuildPipelineCore {
                         $exeFiles = Get-ChildItem -LiteralPath $outputDir -Filter "*.exe" -File -Force -ErrorAction SilentlyContinue
                         foreach ($exe in $exeFiles) {
                             $targetPath = Join-Path $destProjBuilt $exe.Name
-                            Copy-Item -LiteralPath $exe.FullName -Destination $targetPath -Force
-                            $exeCount++
+                            try {
+                                Copy-Item -LiteralPath $exe.FullName -Destination $targetPath -Force -ErrorAction Stop
+                                $exeCount++
+                            } catch {
+                                Write-BuildLog "Warning: could not copy '$($exe.Name)' (is it running or locked?): $($_.Exception.Message)" -ForegroundColor Yellow -UiCallback $UiLog
+                            }
                         }
                     } else {
                         # Non-Windows executable copy: regular files without extensions having executable permissions
@@ -732,8 +902,12 @@ function Start-BuildPipelineCore {
                         foreach ($cand in $allCandidates) {
                             if ([string]::IsNullOrEmpty($cand.Extension) -and $cand.Name -notmatch '\.') {
                                 $targetPath = Join-Path $destProjBuilt $cand.Name
-                                Copy-Item -LiteralPath $cand.FullName -Destination $targetPath -Force
-                                $exeCount++
+                                try {
+                                    Copy-Item -LiteralPath $cand.FullName -Destination $targetPath -Force -ErrorAction Stop
+                                    $exeCount++
+                                } catch {
+                                    Write-BuildLog "Warning: could not copy '$($cand.Name)' (is it running or locked?): $($_.Exception.Message)" -ForegroundColor Yellow -UiCallback $UiLog
+                                }
                             }
                         }
                     }
@@ -837,6 +1011,8 @@ function Start-BuildPipeline {
         [bool]$NoRtkUpdateFlag = $false
     )
     $prevGitCli = $env:CARGO_NET_GIT_FETCH_WITH_CLI
+    # Never start a run with a writer left over from an earlier one.
+    Close-RcbLogWriter
     $script:RcbBuiltDir = $null
     $script:LogFilePath = $null
     $result = $null
@@ -1087,7 +1263,9 @@ function Show-BuildGui {
         [string]$InitialProfile,
         [bool]$InitialTest,
         [bool]$InitialRtkUpdate = $true,
-        [string]$InitialTheme = 'System'
+        [string]$InitialTheme = 'System',
+        [bool]$NoInstall = $false,
+        [bool]$NoOpen = $false
     )
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -1244,6 +1422,8 @@ function Show-BuildGui {
     $chkRtk.Checked = $InitialRtkUpdate
     $cardOpt.Controls.Add($chkRtk)
     $btnBuild = New-RtkButton -Text 'Start Build' -Role 'accent' -Width 150 -Height 42
+    # Build options travel with the button, so the click handler does not depend on scope lookup.
+    $btnBuild.Tag['State'] = @{ NoInstall = [bool]$NoInstall; NoOpen = [bool]$NoOpen }
     $btnBuild.Location = New-Object System.Drawing.Point(($cardOpt.Width - 16 - 150), 52)
     $btnBuild.Anchor = $anchorTR
     $cardOpt.Controls.Add($btnBuild)
@@ -1327,6 +1507,15 @@ function Show-BuildGui {
     }
 
     $btnBuild.add_Click({
+        $optNoInstall = $false
+        $optNoOpen = $false
+        $clickState = $null
+        if ($null -ne $this -and $this.Tag -is [hashtable]) { $clickState = $this.Tag['State'] }
+        if ($clickState -is [hashtable]) {
+            $optNoInstall = [bool]$clickState['NoInstall']
+            $optNoOpen = [bool]$clickState['NoOpen']
+        }
+        try {
         $btnBuild.Enabled = $false
         $btnBrowse.Enabled = $false
         $txtPath.Enabled = $false
@@ -1339,13 +1528,12 @@ function Show-BuildGui {
         $chosenTest = $chkTest.Checked
         $folder = $txtPath.Text.Trim()
 
-        try {
             $pipeResult = Start-BuildPipeline `
                 -TargetFolder $folder `
                 -ActiveProfile $chosenProfile `
                 -RunTests $chosenTest `
-                -NoInstallFlag $NoInstall `
-                -NoOpenFlag $NoOpen `
+                -NoInstallFlag $optNoInstall `
+                -NoOpenFlag $optNoOpen `
                 -UiLog $uiLogger `
                 -PromptUser $guiPrompt `
                 -NoRtkUpdateFlag (-not $chkRtk.Checked)
@@ -1358,6 +1546,18 @@ function Show-BuildGui {
                 $roleName = if ($bad -gt 0) { 'danger' } elseif ($rtkNote -match 'broke|NOT CHECKED') { 'warning' } else { 'success' }
                 $lblStatus.ForeColor = ConvertTo-DrawingColor (Get-RtkRoleRgb $roleName $script:GuiTheme)
             }
+        } catch {
+            # Show the error in the log box instead of crashing the form.
+            $clickError = "Build stopped by an unexpected error: $($_.Exception.Message)"
+            try {
+                & $uiLogger $clickError 'danger'
+            } catch {
+                try { $txtLog.AppendText($clickError + "`r`n") } catch { $null = $_ }
+            }
+            try {
+                $lblStatus.Text = 'Build error. See the log.'
+                $lblStatus.ForeColor = ConvertTo-DrawingColor (Get-RtkRoleRgb 'danger' $script:GuiTheme)
+            } catch { $null = $_ }
         } finally {
             $btnBuild.Enabled = $true
             $btnBrowse.Enabled = $true
@@ -1375,6 +1575,8 @@ function Show-BuildGui {
 # CLI Folder Browser Dialog Fallback
 # -------------------------------------------------------------------------
 function Request-FolderDialog {
+    # Needs an STA thread; the entry point relaunches the script before calling this when not STA.
+    if (-not (Test-RcbStaThread)) { return $null }
     return (Invoke-InSTA {
         Add-Type -AssemblyName System.Windows.Forms
         $browser = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -1404,7 +1606,9 @@ try {
             $guiExeName = 'rcb-gui'
             if ($script:IsWindowsOS) { $guiExeName = 'rcb-gui.exe' }
             $guiReason = 'no rcb-gui executable found'
-            if ($null -ne (Get-Command cargo -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath (Join-Path $guiDir 'Cargo.toml'))) {
+            # A rustup-only install has cargo in ~\.cargo\bin but not on PATH yet.
+            $guiHasCargo = [bool](Add-CargoBinToPath)
+            if ($guiHasCargo -and (Test-Path -LiteralPath (Join-Path $guiDir 'Cargo.toml'))) {
                 # Building through the normal pipeline is what auto-bumps the GUI's own rtk tag.
                 $guiBuild = Start-BuildPipeline -TargetFolder $guiDir -ActiveProfile 'release' -RunTests $false -NoInstallFlag $NoInstall.IsPresent -NoOpenFlag $true -NoRtkUpdateFlag $NoRtkUpdate.IsPresent
                 if ($null -eq $guiBuild -or -not $guiBuild.Success) { $guiReason = 'the GUI build failed and no earlier rcb-gui build exists' }
@@ -1430,11 +1634,9 @@ try {
                 if ($Test) { $guiArgs += '--test' }
                 if ($NoRtkUpdate) { $guiArgs += '--no-rtk-update' }
                 try {
-                    if ($script:IsWindowsOS) {
-                        Start-Process -FilePath $guiExe -ArgumentList (Join-RcbCommandLine $guiArgs)
-                    } else {
-                        Start-Process -FilePath $guiExe -ArgumentList $guiArgs
-                    }
+                    # One quoted command line on every platform: Start-Process joins an
+                    # array with plain spaces, which breaks paths that contain spaces.
+                    Start-Process -FilePath $guiExe -ArgumentList (Join-RcbCommandLine $guiArgs)
                     $scriptExitCode = 0
                     exit 0
                 } catch {
@@ -1450,9 +1652,14 @@ try {
         if (-not $ClassicGui) {
             Write-Host "rtk GUI unavailable ($guiReason); opening the classic window" -ForegroundColor Yellow
         }
-        $scriptExitCode = Invoke-InSTA {
-            Show-BuildGui -InitialPath $Path -InitialProfile $BuildProfile -InitialTest $Test.IsPresent -InitialRtkUpdate (-not $NoRtkUpdate.IsPresent) -InitialTheme $Theme
-        }
+        # When not STA the script is relaunched; -ClassicGui makes the child skip the rtk GUI attempt.
+        $staExtra = @()
+        if (-not $ClassicGui) { $staExtra += '-ClassicGui' }
+        $guiOut = @(Invoke-InSTA -Extra $staExtra -ScriptBlock {
+            Show-BuildGui -InitialPath $Path -InitialProfile $BuildProfile -InitialTest $Test.IsPresent -InitialRtkUpdate (-not $NoRtkUpdate.IsPresent) -InitialTheme $Theme -NoInstall $NoInstall.IsPresent -NoOpen $NoOpen.IsPresent
+        })
+        $scriptExitCode = 0
+        if ($guiOut.Count -gt 0 -and $guiOut[$guiOut.Count - 1] -is [int]) { $scriptExitCode = [int]$guiOut[$guiOut.Count - 1] }
         exit $scriptExitCode
     }
 
@@ -1460,6 +1667,13 @@ try {
     # the folder itself so the summary event is still emitted; no dialog, no output)
     if (-not $JsonProgress -and [string]::IsNullOrEmpty($Path)) {
         if ($script:IsWindowsOS) {
+            if (-not (Test-RcbStaThread)) {
+                # The folder dialog needs STA: let an STA child run the whole build.
+                $relaunchExtra = @()
+                if (-not $NoPause) { $relaunchExtra += '-NoPause' }
+                $scriptExitCode = [int](Invoke-RcbStaRelaunch -Extra $relaunchExtra)
+                exit $scriptExitCode
+            }
             Write-Host "No path supplied. Opening folder selection dialog..." -ForegroundColor Cyan
             $selected = Request-FolderDialog
             if ([string]::IsNullOrEmpty($selected)) {
@@ -1513,8 +1727,11 @@ try {
     }
 
     if (-not $JsonProgress -and -not $Gui -and -not $ClassicGui -and -not $NoPause) {
-        Write-Host ""
-        $null = Read-Host "Press Enter to close"
+        # Read-Host throws in a non-interactive host; that must not replace the exit code.
+        try {
+            Write-Host ""
+            $null = Read-Host "Press Enter to close"
+        } catch { $null = $_ }
     }
 
     exit $scriptExitCode

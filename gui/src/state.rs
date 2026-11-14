@@ -8,6 +8,17 @@ use crate::protocol::{Event, Line, Role};
 pub const DEFAULT_LOG_CAPACITY: usize = 4000;
 /// Upper bound on project indices accepted from the child.
 const MAX_PROJECTS: u64 = 10_000;
+/// Longest retained log line in characters; longer lines are cut.
+const MAX_LOG_LINE_CHARS: usize = 4096;
+
+/// Index to show as "current project": 0 (none) when out of range.
+fn shown_index(index: u64) -> u64 {
+    if (1..=MAX_PROJECTS).contains(&index) {
+        index
+    } else {
+        0
+    }
+}
 
 /// Overall run status shown in the header chip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,14 +222,18 @@ impl BuildState {
             Event::Log { text, role } => self.push_log(*role, text.clone()),
             Event::Discovered { count, projects } => {
                 self.total = (*count).min(MAX_PROJECTS);
-                self.rows = projects.iter().map(|p| ProjectRow::queued(p)).collect();
+                self.rows = projects
+                    .iter()
+                    .take(MAX_PROJECTS as usize)
+                    .map(|p| ProjectRow::queued(p))
+                    .collect();
                 self.table_rev += 1;
             }
             Event::ProjectStart {
                 index, total, name, ..
             } => {
                 self.total = self.total.max((*total).min(MAX_PROJECTS));
-                self.current_index = *index;
+                self.current_index = shown_index(*index);
                 self.current_name = name.clone();
                 self.current_phase.clear();
                 if let Some(row) = self.row_mut(*index) {
@@ -228,7 +243,7 @@ impl BuildState {
                 }
             }
             Event::Phase { index, name, phase } => {
-                self.current_index = *index;
+                self.current_index = shown_index(*index);
                 self.current_name = name.clone();
                 self.current_phase = phase.clone();
                 if let Some(row) = self.row_mut(*index) {
@@ -333,7 +348,12 @@ impl BuildState {
         while self.log.len() >= self.log_capacity {
             self.log.pop_front();
         }
-        self.log.push_back((role, text.into()));
+        let mut text: String = text.into();
+        if let Some((cut, _)) = text.char_indices().nth(MAX_LOG_LINE_CHARS) {
+            text.truncate(cut);
+            text.push('…');
+        }
+        self.log.push_back((role, text));
         self.log_rev += 1;
     }
 
@@ -686,6 +706,42 @@ mod tests {
         st.apply_line(Line::Malformed("@@RCB {oops".into()));
         st.apply_line(Line::Unknown("x".into()));
         assert_eq!(st.log_len(), 1);
+    }
+
+    #[test]
+    fn oversized_input_is_bounded() {
+        let mut st = BuildState::new();
+        st.begin();
+        st.push_log(Role::Text, "é".repeat(MAX_LOG_LINE_CHARS * 3));
+        let (_, text) = st.log_tail(1).next().expect("one line");
+        assert_eq!(text.chars().count(), MAX_LOG_LINE_CHARS + 1);
+
+        st.apply(&Event::Discovered {
+            count: u64::MAX,
+            projects: vec![String::new(); MAX_PROJECTS as usize + 50],
+        });
+        assert_eq!(st.rows().len(), MAX_PROJECTS as usize);
+        assert_eq!(st.total(), MAX_PROJECTS);
+    }
+
+    #[test]
+    fn out_of_range_current_index_is_not_shown() {
+        let huge = u64::MAX.to_string();
+        let mut st = started();
+        st.apply(&Event::ProjectStart {
+            index: u64::MAX,
+            total: 4,
+            name: "x".into(),
+            dir: "d".into(),
+        });
+        assert!(!st.progress_text().contains(&huge));
+        st.apply(&Event::Phase {
+            index: u64::MAX,
+            name: "x".into(),
+            phase: "build".into(),
+        });
+        assert!(!st.progress_text().contains(&huge));
+        assert_eq!(st.rows().len(), 4);
     }
 
     #[test]
