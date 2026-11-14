@@ -147,6 +147,13 @@ function Test-RtkTrueColor {
     } catch { return $false }
 }
 $script:RtkTrueColor = Test-RtkTrueColor
+# When $true, Write-RtkSegment writes plain text (no colour at all). build.ps1
+# can set this for machine-readable output.
+$script:RtkPlainConsole = $false
+# ANSI prefix per role (and bold flag), built on first use. The console theme
+# does not change during a run.
+$script:RtkAnsiCache = @{}
+$script:RtkAnsiReset = ([string][char]27) + '[0m'
 
 <#
 .SYNOPSIS
@@ -174,11 +181,21 @@ function Get-RtkRoleRgb {
 #>
 function Write-RtkSegment {
     param([string]$Text, [string]$Role = 'text', [switch]$Bold, [switch]$NewLine)
+    if ($script:RtkPlainConsole) {
+        if ($NewLine) { Write-Host $Text } else { Write-Host $Text -NoNewline }
+        return
+    }
     if ($script:RtkTrueColor) {
-        $rgb = Get-RtkRoleRgb $Role
-        $esc = [char]27
-        $b = if ($Bold) { "$esc[1m" } else { '' }
-        $s = "$esc[38;2;$($rgb[0]);$($rgb[1]);$($rgb[2])m$b$Text$esc[0m"
+        $key = if ($Bold) { $Role + '|b' } else { $Role }
+        $pre = $script:RtkAnsiCache[$key]
+        if ($null -eq $pre) {
+            $rgb = Get-RtkRoleRgb $Role
+            $esc = [string][char]27
+            $pre = $esc + '[38;2;' + $rgb[0] + ';' + $rgb[1] + ';' + $rgb[2] + 'm'
+            if ($Bold) { $pre += $esc + '[1m' }
+            $script:RtkAnsiCache[$key] = $pre
+        }
+        $s = $pre + $Text + $script:RtkAnsiReset
         if ($NewLine) { Write-Host $s } else { Write-Host $s -NoNewline }
     } else {
         $cc = $script:RtkRoleConsoleFallback[$Role]

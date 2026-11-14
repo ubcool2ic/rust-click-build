@@ -33,7 +33,15 @@ param(
     # GUI theme. System follows the Windows light/dark/high-contrast setting.
     [Parameter()]
     [ValidateSet('System', 'Light', 'Dark', 'HighContrast')]
-    [string]$Theme = 'System'
+    [string]$Theme = 'System',
+
+    # Machine-readable progress on stdout ("@@RCB {json}" lines). Implies -NoPause.
+    [Parameter()]
+    [switch]$JsonProgress,
+
+    # Open the legacy WinForms window instead of the rtk GUI.
+    [Parameter()]
+    [switch]$ClassicGui
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +49,12 @@ $ErrorActionPreference = 'Stop'
 # rtk design tokens (console + GUI colours) and the forced rtk update check.
 . (Join-Path $PSScriptRoot (Join-Path 'lib' 'RtkTheme.ps1'))
 . (Join-Path $PSScriptRoot (Join-Path 'lib' 'RtkUpdate.ps1'))
+. (Join-Path $PSScriptRoot (Join-Path 'lib' 'RcbProgress.ps1'))
+if ($JsonProgress) {
+    $script:RcbJsonProgress = $true
+    $script:RtkPlainConsole = $true
+    $NoPause = $true
+}
 
 # Determine Windows platform reliably across PS 5.1 and pwsh Core
 $script:IsWindowsOS = ($env:OS -eq 'Windows_NT')
@@ -49,6 +63,11 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
         $script:IsWindowsOS = $false
     }
 }
+
+# Old function names kept working for scripts and tests that call them.
+Set-Alias -Name Refresh-SystemPath -Value Update-SessionPath
+Set-Alias -Name Test-And-InstallPrereqs -Value Test-BuildPrerequisite
+Set-Alias -Name Find-CargoProjects -Value Find-CargoProject
 
 # -------------------------------------------------------------------------
 # Helper: STA Thread Runner (required for WinForms dialogs on pwsh Core)
@@ -60,8 +79,6 @@ function Invoke-InSTA {
         return (& $ScriptBlock)
     }
 
-    $result = $null
-    $threadError = $null
     $thread = New-Object System.Threading.Thread([System.Threading.ThreadStart]{
         try {
             $script:staOutput = & $ScriptBlock
@@ -129,21 +146,20 @@ function Write-BuildLog {
     )
 
     if ([string]::IsNullOrEmpty($Role)) { $Role = ConvertTo-RtkRole ([string]$ForegroundColor) }
-    Write-RtkConsoleLine -Message $Message -Role $Role
-
-    if ($null -ne $script:LogFilePath -and [System.IO.File]::Exists($script:LogFilePath)) {
-        try {
-            [System.IO.File]::AppendAllText($script:LogFilePath, "$Message`r`n")
-        } catch {
-            # Suppress log write failures
-        }
+    if ($script:RcbJsonProgress) {
+        Write-RcbEvent 'log' ([ordered]@{ text = $Message; role = $Role })
+    } else {
+        Write-RtkConsoleLine -Message $Message -Role $Role
     }
+
+    Write-RcbLogLine $Message
 
     if ($null -ne $UiCallback) {
         try {
             & $UiCallback $Message $Role
         } catch {
             # Suppress UI write failures
+            $null = $_
         }
     }
 }
@@ -151,7 +167,7 @@ function Write-BuildLog {
 # -------------------------------------------------------------------------
 # Environment & PATH Refresh
 # -------------------------------------------------------------------------
-function Refresh-SystemPath {
+function Update-SessionPath {
     if ($script:IsWindowsOS) {
         try {
             $machinePath = [System.Environment]::GetEnvironmentVariable('Path', [System.EnvironmentVariableTarget]::Machine)
@@ -162,6 +178,7 @@ function Refresh-SystemPath {
             $env:PATH = ($parts -join [System.IO.Path]::PathSeparator)
         } catch {
             # Ignore registry access limits
+            $null = $_
         }
     }
 }
@@ -179,15 +196,7 @@ function Invoke-ToolProcess {
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
-    $escapedArgs = @()
-    foreach ($arg in $ArgumentList) {
-        if ($arg -match '\s|"') {
-            $escapedArgs += ('"' + ($arg -replace '"', '\"') + '"')
-        } else {
-            $escapedArgs += $arg
-        }
-    }
-    $psi.Arguments = ($escapedArgs -join ' ')
+    $null = Set-RcbProcessArgument -StartInfo $psi -ArgumentList $ArgumentList
     if (-not [string]::IsNullOrEmpty($WorkingDirectory)) { $psi.WorkingDirectory = $WorkingDirectory }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
@@ -198,7 +207,17 @@ function Invoke-ToolProcess {
     $process.StartInfo = $psi
     $capturedLines = New-Object System.Collections.Generic.List[string]
 
-    $process.Start() | Out-Null
+    try {
+        $process.Start() | Out-Null
+    } catch {
+        $msg = $_.Exception.Message
+        if ($null -ne $_.Exception.InnerException) { $msg = $_.Exception.InnerException.Message }
+        try { $process.Dispose() } catch { $null = $_ }
+        $failLine = "failed to start ${FilePath}: $msg"
+        if ($null -ne $OnOutputLine) { & $OnOutputLine $failLine }
+        return [PSCustomObject]@{ ExitCode = -1; Lines = @($failLine) }
+    }
+    try {
     # stdout is drained by a .NET task (no PowerShell script on background threads);
     # cargo writes its progress and errors to stderr, which we stream line by line here.
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
@@ -220,12 +239,15 @@ function Invoke-ToolProcess {
         ExitCode = $process.ExitCode
         Lines    = $capturedLines.ToArray()
     }
+    } finally {
+        try { $process.Dispose() } catch { $null = $_ }
+    }
 }
 
 # -------------------------------------------------------------------------
 # Prerequisite Verification & Installation
 # -------------------------------------------------------------------------
-function Test-And-InstallPrereqs {
+function Test-BuildPrerequisite {
     param(
         [bool]$NoInstallFlag,
         [scriptblock]$UiLog = $null,
@@ -287,17 +309,7 @@ function Test-And-InstallPrereqs {
     if ($needsMsvc)  { $installQuestion += "  - Visual Studio C++ Build Tools (MSVC)`n" }
     $installQuestion += "`nWould you like to automatically install them now?"
 
-    $consent = $false
-    if ($null -ne $PromptUser) {
-        $consent = & $PromptUser $installQuestion
-    } else {
-        Write-Host ""
-        Write-Host $installQuestion -ForegroundColor Yellow
-        $response = Read-Host "Proceed with automated installation? (Y/N)"
-        if ($response -match '^[Yy]') {
-            $consent = $true
-        }
-    }
+    $consent = Request-RcbConfirm -Id 'install-prereqs' -Question $installQuestion -PromptUser $PromptUser
 
     if (-not $consent) {
         Write-BuildLog "Installation declined by user. Required prerequisites missing." -ForegroundColor Red -UiCallback $UiLog
@@ -314,13 +326,13 @@ function Test-And-InstallPrereqs {
     if ($needsCargo) {
         Write-BuildLog "Installing Rust toolchain..." -ForegroundColor Cyan -UiCallback $UiLog
         if ($hasWinget) {
-            & winget install --id Rustlang.Rustup -e --accept-source-agreements --accept-package-agreements
+            & winget install --id Rustlang.Rustup -e --accept-source-agreements --accept-package-agreements | ForEach-Object { Write-BuildLog "  $_" -Role muted -UiCallback $UiLog }
         } else {
             if ($script:IsWindowsOS) {
                 $tempInit = Join-Path $env:TEMP "rustup-init.exe"
                 Write-BuildLog "Downloading rustup-init from https://win.rustup.rs/x86_64..." -ForegroundColor Cyan -UiCallback $UiLog
                 Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $tempInit
-                & $tempInit -y
+                & $tempInit -y | ForEach-Object { Write-BuildLog "  $_" -Role muted -UiCallback $UiLog }
             } else {
                 Write-BuildLog "Please install rustup manually: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" -ForegroundColor Red -UiCallback $UiLog
             }
@@ -331,7 +343,7 @@ function Test-And-InstallPrereqs {
     if ($needsMsvc) {
         Write-BuildLog "Installing Visual Studio C++ Build Tools..." -ForegroundColor Cyan -UiCallback $UiLog
         if ($hasWinget) {
-            & winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+            & winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" | ForEach-Object { Write-BuildLog "  $_" -Role muted -UiCallback $UiLog }
         } else {
             Write-BuildLog "winget not found. Opening Visual Studio Build Tools download page..." -ForegroundColor Yellow -UiCallback $UiLog
             $url = "https://visualstudio.microsoft.com/visual-cpp-build-tools/"
@@ -342,7 +354,7 @@ function Test-And-InstallPrereqs {
         }
     }
 
-    Refresh-SystemPath
+    Update-SessionPath
 
     if (-not [string]::IsNullOrEmpty($userHome)) {
         $cargoBin = Join-Path $userHome (Join-Path ".cargo" "bin")
@@ -366,68 +378,20 @@ function Test-And-InstallPrereqs {
 # -------------------------------------------------------------------------
 # Manifest & Project Discovery
 # -------------------------------------------------------------------------
-function Find-CargoProjects {
+function Find-CargoProject {
     param([string]$RootDirectory)
 
-    $allTomls = Get-ChildItem -LiteralPath $RootDirectory -Filter "Cargo.toml" -Recurse -File -Force -ErrorAction SilentlyContinue
-    if ($null -eq $allTomls -or $allTomls.Count -eq 0) {
-        return @()
+    # Shared scanner from lib/RtkUpdate.ps1 (one directory walk, workspace members dropped).
+    $items = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($p in @(Get-RcbCargoManifest -RootDirectory $RootDirectory -ExcludeWorkspaceMembers)) {
+        if ($p -is [System.IO.FileInfo]) {
+            $items.Add($p)
+        } elseif (-not [string]::IsNullOrEmpty([string]$p)) {
+            $items.Add((New-Object System.IO.FileInfo([string]$p)))
+        }
     }
-
-    # Filter invalid paths: target, .git, node_modules, _built
-    $validManifests = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-    foreach ($item in $allTomls) {
-        $fullPath = $item.FullName
-        $sep = [System.IO.Path]::DirectorySeparatorChar
-        $alt = [System.IO.Path]::AltDirectorySeparatorChar
-        if ($fullPath -match "[\$sep$alt]target[\$sep$alt]" -or
-            $fullPath -match "[\$sep$alt]\.git[\$sep$alt]" -or
-            $fullPath -match "[\$sep$alt]node_modules[\$sep$alt]" -or
-            $fullPath -match "[\$sep$alt]_built[\$sep$alt]") {
-            continue
-        }
-        $validManifests.Add($item)
-    }
-
-    # Sort manifests by folder depth so top-level workspaces are evaluated first
-    $sortedManifests = $validManifests | Sort-Object { ($_.DirectoryName -split '[\\/]').Count }
-
-    $acceptedWorkspaceRoots = New-Object System.Collections.Generic.List[string]
-    $finalProjects = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-
-    foreach ($manifest in $sortedManifests) {
-        $dir = $manifest.DirectoryName
-
-        # Check if dir is under any accepted workspace root
-        $isInsideWorkspace = $false
-        foreach ($wsRoot in $acceptedWorkspaceRoots) {
-            $prefix = $wsRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
-            if ($dir.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $isInsideWorkspace = $true
-                break
-            }
-        }
-
-        if ($isInsideWorkspace) {
-            continue
-        }
-
-        # Check if this Cargo.toml declares a [workspace]
-        $content = Get-Content -LiteralPath $manifest.FullName -Raw -ErrorAction SilentlyContinue
-        $isWorkspace = $false
-        if (-not [string]::IsNullOrEmpty($content)) {
-            if ($content -match '(?m)^\s*\[workspace\]') {
-                $isWorkspace = $true
-            }
-        }
-
-        if ($isWorkspace) {
-            $acceptedWorkspaceRoots.Add($dir)
-        }
-        $finalProjects.Add($manifest)
-    }
-
-    return $finalProjects.ToArray()
+    $sorted = @($items | Sort-Object { ($_.DirectoryName -split '[\\/]').Count }, FullName)
+    return ,([System.IO.FileInfo[]]$sorted)
 }
 
 # -------------------------------------------------------------------------
@@ -459,30 +423,29 @@ function Invoke-CargoBuildStep {
         } else {
             # Parse errors from build output
             $recordingError = $false
-            $currentErrBlock = ""
+            $errBlock = New-Object System.Text.StringBuilder
             foreach ($line in $procResult.Lines) {
                 if ($line -match '^error(\[E\d+\])?:') {
-                    if (-not [string]::IsNullOrEmpty($currentErrBlock) -and $firstErrors.Count -lt 3) {
-                        $firstErrors.Add($currentErrBlock)
+                    if ($errBlock.Length -gt 0 -and $firstErrors.Count -lt 3) {
+                        $firstErrors.Add($errBlock.ToString())
                     }
-                    $currentErrBlock = $line
+                    $errBlock.Length = 0
+                    [void]$errBlock.Append($line)
                     $recordingError = $true
-                    $hint = Get-FriendlyHint -Text $line
-                    if (-not [string]::IsNullOrEmpty($hint) -and -not ($firstHints -contains $hint)) {
-                        $firstHints.Add($hint)
-                    }
                 } elseif ($recordingError -and $line -match '^\s*-->\s+') {
-                    $currentErrBlock += "`n  " + $line
+                    [void]$errBlock.Append("`n  ").Append($line)
                     $recordingError = $false
-                } else {
+                    continue
+                }
+                if ($firstHints.Count -lt 3) {
                     $hint = Get-FriendlyHint -Text $line
                     if (-not [string]::IsNullOrEmpty($hint) -and -not ($firstHints -contains $hint)) {
                         $firstHints.Add($hint)
                     }
                 }
             }
-            if (-not [string]::IsNullOrEmpty($currentErrBlock) -and $firstErrors.Count -lt 3) {
-                $firstErrors.Add($currentErrBlock)
+            if ($errBlock.Length -gt 0 -and $firstErrors.Count -lt 3) {
+                $firstErrors.Add($errBlock.ToString())
             }
         }
     } catch {
@@ -527,14 +490,16 @@ function Write-SummaryTable {
         if ($role -eq 'rtkchange') {
             $m = [regex]::Match($l, '^(.*?)(\S+)( -> )(\S+)(.*)$')
             if ($m.Success) {
-                Write-RtkSegment $m.Groups[1].Value 'success'
-                Write-RtkSegment $m.Groups[2].Value 'warning' -Bold
-                Write-RtkSegment $m.Groups[3].Value 'muted'
-                Write-RtkSegment $m.Groups[4].Value 'success' -Bold
-                Write-RtkSegment $m.Groups[5].Value 'success' -NewLine
-                if ($null -ne $script:LogFilePath -and [System.IO.File]::Exists($script:LogFilePath)) {
-                    try { [System.IO.File]::AppendAllText($script:LogFilePath, "$l`r`n") } catch { $null = $_ }
+                if ($script:RcbJsonProgress) {
+                    Write-RcbEvent 'log' ([ordered]@{ text = $l; role = 'rtkchange' })
+                } else {
+                    Write-RtkSegment $m.Groups[1].Value 'success'
+                    Write-RtkSegment $m.Groups[2].Value 'warning' -Bold
+                    Write-RtkSegment $m.Groups[3].Value 'muted'
+                    Write-RtkSegment $m.Groups[4].Value 'success' -Bold
+                    Write-RtkSegment $m.Groups[5].Value 'success' -NewLine
                 }
+                Write-RcbLogLine $l
                 if ($null -ne $UiLog) { try { & $UiLog $l 'rtkchange' } catch { $null = $_ } }
                 continue
             }
@@ -553,7 +518,7 @@ function Write-SummaryTable {
 # -------------------------------------------------------------------------
 # Core Build Engine
 # -------------------------------------------------------------------------
-function Start-BuildPipeline {
+function Start-BuildPipelineCore {
     param(
         [string]$TargetFolder,
         [string]$ActiveProfile,
@@ -593,6 +558,9 @@ function Start-BuildPipeline {
         $timestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $script:LogFilePath = Join-Path $builtDir "build-$timestamp.log"
         [System.IO.File]::WriteAllText($script:LogFilePath, "Build started: $(Get-Date)`r`nPath: $resolvedPath`r`nProfile: $ActiveProfile`r`n`r`n")
+        Open-RcbLogWriter $script:LogFilePath
+        $script:RcbBuiltDir = $builtDir
+        Write-RcbEvent 'start' ([ordered]@{ version = 1; path = $resolvedPath; profile = $ActiveProfile; test = $RunTests; rtk_update = (-not $NoRtkUpdateFlag); log_file = $script:LogFilePath })
 
         Write-BuildLog "==========================================================" -ForegroundColor Cyan -UiCallback $UiLog
         Write-BuildLog " Rust Project Builder: $resolvedPath" -ForegroundColor Cyan -UiCallback $UiLog
@@ -600,7 +568,7 @@ function Start-BuildPipeline {
         Write-BuildLog "==========================================================" -ForegroundColor Cyan -UiCallback $UiLog
 
         # Check prereqs
-        $prereqsOk = Test-And-InstallPrereqs -NoInstallFlag $NoInstallFlag -UiLog $UiLog -PromptUser $PromptUser
+        $prereqsOk = Test-BuildPrerequisite -NoInstallFlag $NoInstallFlag -UiLog $UiLog -PromptUser $PromptUser
         if (-not $prereqsOk) {
             Write-BuildLog "Terminating: Prerequisites are unmet." -ForegroundColor Red -UiCallback $UiLog
             return [PSCustomObject]@{ Success = $false; Cancelled = $false; Results = $summaryResults }
@@ -617,7 +585,7 @@ function Start-BuildPipeline {
 
         # Project discovery
         Write-BuildLog "Scanning for Cargo projects..." -ForegroundColor Gray -UiCallback $UiLog
-        $projects = Find-CargoProjects -RootDirectory $resolvedPath
+        $projects = Find-CargoProject -RootDirectory $resolvedPath
 
         if ($projects.Count -eq 0) {
             Write-BuildLog "No Cargo.toml manifests found in '$resolvedPath'. Pick the folder that contains your Rust project (the one with Cargo.toml)." -ForegroundColor Yellow -UiCallback $UiLog
@@ -625,6 +593,7 @@ function Start-BuildPipeline {
         }
 
         Write-BuildLog "Discovered $($projects.Count) project(s)/workspace(s).`n" -ForegroundColor Green -UiCallback $UiLog
+        Write-RcbEvent 'discovered' ([ordered]@{ count = $projects.Count; projects = [string[]]@($projects | ForEach-Object { $_.Directory.Name }) })
 
         $projIndex = 0
         foreach ($manifest in $projects) {
@@ -634,6 +603,7 @@ function Start-BuildPipeline {
             $projManifestPath = $manifest.FullName
 
             $projTimer = [System.Diagnostics.Stopwatch]::StartNew()
+            Write-RcbEvent 'project_start' ([ordered]@{ index = $projIndex; total = $projects.Count; name = $projName; dir = $projDir })
             Write-BuildLog "[$projIndex/$($projects.Count)] Building project '$projName'..." -ForegroundColor Cyan -UiCallback $UiLog
 
             $buildPassed = $false
@@ -656,6 +626,8 @@ function Start-BuildPipeline {
                 }
             } catch {
                 # Fallback on target directory error
+                $null = $_
+            $null = $_
             }
 
             if ([string]::IsNullOrEmpty($targetDir)) {
@@ -666,6 +638,7 @@ function Start-BuildPipeline {
             $outputDir = Join-Path $targetDir $profileSubdir
 
             # Forced rtk update check (before every cargo build)
+            Write-RcbEvent 'phase' ([ordered]@{ index = $projIndex; name = $projName; phase = 'rtk' })
             $rtkRes = $null
             if ($NoRtkUpdateFlag) {
                 $rtkStatus = 'skipped (-NoRtkUpdate)'
@@ -682,6 +655,8 @@ function Start-BuildPipeline {
                 }
             }
 
+            Write-RcbEvent 'rtk' ([ordered]@{ index = $projIndex; name = $projName; status = [string]$rtkStatus; changed = [bool]($null -ne $rtkRes -and $rtkRes.Changed) })
+            Write-RcbEvent 'phase' ([ordered]@{ index = $projIndex; name = $projName; phase = 'build' })
             # Build Step
             $build = Invoke-CargoBuildStep -ManifestPath $projManifestPath -ProjectDir $projDir -ActiveProfile $ActiveProfile -UiLog $UiLog
             $buildPassed = $build.Passed
@@ -693,7 +668,11 @@ function Start-BuildPipeline {
             if (-not $buildPassed -and $null -ne $rtkRes -and $rtkRes.Changed) {
                 $rtkErrors = @($build.FirstErrors)
                 Write-BuildLog "  rtk: the build FAILED after the rtk update. Restoring the backup and rebuilding on $($rtkRes.KeptLabel)..." -Role danger -UiCallback $UiLog
-                Restore-RtkBackup -Pairs $rtkRes.Backup
+                # Captured so restore output cannot leak into the pipeline result.
+                $restoreOut = @(Restore-RtkBackup -Pairs $rtkRes.Backup)
+                foreach ($rf in $restoreOut) {
+                    if ($rf -is [string] -and $rf -ne '') { Write-BuildLog "  rtk: restore problem: $rf" -Role danger -UiCallback $UiLog }
+                }
                 $firstErrors.Clear(); $firstHints.Clear()
                 $build = Invoke-CargoBuildStep -ManifestPath $projManifestPath -ProjectDir $projDir -ActiveProfile $ActiveProfile -UiLog $UiLog
                 $buildPassed = $build.Passed
@@ -707,6 +686,7 @@ function Start-BuildPipeline {
 
             # Test Step (optional)
             if ($buildPassed -and $RunTests) {
+                Write-RcbEvent 'phase' ([ordered]@{ index = $projIndex; name = $projName; phase = 'test' })
                 Write-BuildLog "  Running tests for '$projName'..." -ForegroundColor Cyan -UiCallback $UiLog
                 try {
                     $testArgs = @("test", "--manifest-path", $projManifestPath)
@@ -731,6 +711,7 @@ function Start-BuildPipeline {
             }
 
             # Copy Outputs Step
+            Write-RcbEvent 'phase' ([ordered]@{ index = $projIndex; name = $projName; phase = 'collect' })
             if ($buildPassed -and (Test-Path -LiteralPath $outputDir)) {
                 try {
                     $destProjBuilt = Join-Path $builtDir $projName
@@ -804,7 +785,14 @@ function Start-BuildPipeline {
                 RtkErrors   = $rtkErrors
             })
 
+            $testEvt = 'N/A'
+            if ($testPassed -eq $true) { $testEvt = 'PASS' } elseif ($testPassed -eq $false) { $testEvt = 'FAIL' }
+            $buildEvt = 'FAIL'
+            if ($buildPassed) { $buildEvt = 'PASS' }
+            Write-RcbEvent 'project_end' ([ordered]@{ index = $projIndex; name = $projName; build = $buildEvt; test = $testEvt; artifacts = $exeCount; seconds = $elapsedSec; rtk = [string]$rtkStatus; errors = [string[]]$firstErrors.ToArray(); hints = [string[]]$firstHints.ToArray() })
+
             Write-BuildLog "" -UiCallback $UiLog
+            if ($null -ne $script:LogWriter) { try { $script:LogWriter.Flush() } catch { $null = $_ } }
         }
 
         # Summary Display
@@ -817,6 +805,8 @@ function Start-BuildPipeline {
                 Start-Process "explorer.exe" -ArgumentList "`"$builtDir`""
             } catch {
                 # Ignore explorer launch failures
+                $null = $_
+            $null = $_
             }
         }
 
@@ -829,6 +819,46 @@ function Start-BuildPipeline {
         Write-BuildLog "Unexpected pipeline error: $($_.Exception.Message)" -ForegroundColor Red -UiCallback $UiLog
         return [PSCustomObject]@{ Success = $false; Cancelled = $false; Results = $summaryResults }
     }
+}
+
+# -------------------------------------------------------------------------
+# Pipeline wrapper: closes the log writer, restores the environment and
+# emits the single JSON "summary" event (also on early returns).
+# -------------------------------------------------------------------------
+function Start-BuildPipeline {
+    param(
+        [string]$TargetFolder,
+        [string]$ActiveProfile,
+        [bool]$RunTests,
+        [bool]$NoInstallFlag,
+        [bool]$NoOpenFlag,
+        [scriptblock]$UiLog = $null,
+        [scriptblock]$PromptUser = $null,
+        [bool]$NoRtkUpdateFlag = $false
+    )
+    $prevGitCli = $env:CARGO_NET_GIT_FETCH_WITH_CLI
+    $script:RcbBuiltDir = $null
+    $script:LogFilePath = $null
+    $result = $null
+    try {
+        $out = @(Start-BuildPipelineCore @PSBoundParameters)
+        $result = $out | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Success'] } | Select-Object -Last 1
+    } finally {
+        Close-RcbLogWriter
+        $env:CARGO_NET_GIT_FETCH_WITH_CLI = $prevGitCli
+    }
+
+    $exitCode = 1; $success = $false; $cancelled = $false; $passed = 0; $failed = 0
+    if ($null -ne $result) {
+        $success = [bool]$result.Success
+        $cancelled = [bool]$result.Cancelled
+        if ($cancelled) { $exitCode = 2 } elseif ($success) { $exitCode = 0 }
+        foreach ($r in @($result.Results)) {
+            if ($r.BuildStatus -eq 'PASS') { $passed++ } else { $failed++ }
+        }
+    }
+    Write-RcbEvent 'summary' ([ordered]@{ success = $success; cancelled = $cancelled; exit_code = $exitCode; built_dir = $script:RcbBuiltDir; log_file = $script:LogFilePath; passed = $passed; failed = $failed })
+    return $result
 }
 
 # -------------------------------------------------------------------------
@@ -1367,10 +1397,58 @@ if ($MyInvocation.InvocationName -eq '.' -or $env:RCB_NO_MAIN -eq '1') { return 
 $scriptExitCode = 0
 
 try {
-    if ($Gui) {
+    if ($Gui -or $ClassicGui) {
+        $guiReason = 'classic window requested'
+        if (-not $ClassicGui) {
+            $guiDir = Join-Path $PSScriptRoot 'gui'
+            $guiExeName = 'rcb-gui'
+            if ($script:IsWindowsOS) { $guiExeName = 'rcb-gui.exe' }
+            $guiReason = 'no rcb-gui executable found'
+            if ($null -ne (Get-Command cargo -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath (Join-Path $guiDir 'Cargo.toml'))) {
+                # Building through the normal pipeline is what auto-bumps the GUI's own rtk tag.
+                $guiBuild = Start-BuildPipeline -TargetFolder $guiDir -ActiveProfile 'release' -RunTests $false -NoInstallFlag $NoInstall.IsPresent -NoOpenFlag $true -NoRtkUpdateFlag $NoRtkUpdate.IsPresent
+                if ($null -eq $guiBuild -or -not $guiBuild.Success) { $guiReason = 'the GUI build failed and no earlier rcb-gui build exists' }
+            } else {
+                $guiReason = 'cargo or gui\Cargo.toml is missing and there is no prebuilt rcb-gui'
+            }
+            $guiCandidates = @(
+                (Join-Path $guiDir (Join-Path '_built' (Join-Path 'rcb-gui' $guiExeName))),
+                (Join-Path $guiDir (Join-Path '_built' (Join-Path 'gui' $guiExeName)))
+            )
+            if (-not [string]::IsNullOrEmpty($env:CARGO_TARGET_DIR)) {
+                $guiCandidates += (Join-Path $env:CARGO_TARGET_DIR (Join-Path 'release' $guiExeName))
+            }
+            $guiCandidates += (Join-Path $guiDir (Join-Path 'target' (Join-Path 'release' $guiExeName)))
+            $guiCandidates += (Join-Path $guiDir (Join-Path 'bin' $guiExeName))
+            $guiExe = $null
+            foreach ($cand in $guiCandidates) {
+                if (Test-Path -LiteralPath $cand -PathType Leaf) { $guiExe = $cand; break }
+            }
+            if ($null -ne $guiExe) {
+                $guiArgs = @('--script', $PSCommandPath, '--theme', $Theme, '--profile', $BuildProfile)
+                if (-not [string]::IsNullOrEmpty($Path)) { $guiArgs += @('--path', $Path) }
+                if ($Test) { $guiArgs += '--test' }
+                if ($NoRtkUpdate) { $guiArgs += '--no-rtk-update' }
+                try {
+                    if ($script:IsWindowsOS) {
+                        Start-Process -FilePath $guiExe -ArgumentList (Join-RcbCommandLine $guiArgs)
+                    } else {
+                        Start-Process -FilePath $guiExe -ArgumentList $guiArgs
+                    }
+                    $scriptExitCode = 0
+                    exit 0
+                } catch {
+                    $guiReason = "could not start ${guiExe}: $($_.Exception.Message)"
+                }
+            }
+        }
         if (-not $script:IsWindowsOS) {
-            Write-Host "GUI mode requires Windows Forms support." -ForegroundColor Red
+            Write-Host "Error: GUI unavailable ($guiReason). The classic window requires Windows." -ForegroundColor Red
+            $scriptExitCode = 1
             exit 1
+        }
+        if (-not $ClassicGui) {
+            Write-Host "rtk GUI unavailable ($guiReason); opening the classic window" -ForegroundColor Yellow
         }
         $scriptExitCode = Invoke-InSTA {
             Show-BuildGui -InitialPath $Path -InitialProfile $BuildProfile -InitialTest $Test.IsPresent -InitialRtkUpdate (-not $NoRtkUpdate.IsPresent) -InitialTheme $Theme
@@ -1378,8 +1456,9 @@ try {
         exit $scriptExitCode
     }
 
-    # Non-GUI mode: resolve folder path
-    if ([string]::IsNullOrEmpty($Path)) {
+    # Non-GUI mode: resolve folder path (with -JsonProgress the pipeline validates
+    # the folder itself so the summary event is still emitted; no dialog, no output)
+    if (-not $JsonProgress -and [string]::IsNullOrEmpty($Path)) {
         if ($script:IsWindowsOS) {
             Write-Host "No path supplied. Opening folder selection dialog..." -ForegroundColor Cyan
             $selected = Request-FolderDialog
@@ -1396,7 +1475,7 @@ try {
         }
     }
 
-    if (-not (Test-Path -LiteralPath $Path)) {
+    if (-not $JsonProgress -and -not (Test-Path -LiteralPath $Path)) {
         Write-Host "Error: Specified path '$Path' does not exist." -ForegroundColor Red
         $scriptExitCode = 2
         exit $scriptExitCode
@@ -1421,15 +1500,19 @@ try {
         $scriptExitCode = 1
     }
 } catch {
-    Write-Host "FATAL: Unhandled script exception: $($_.Exception.Message)" -ForegroundColor Red
+    if ($JsonProgress) {
+        Write-RcbEvent 'fatal' ([ordered]@{ message = [string]$_.Exception.Message })
+    } else {
+        Write-Host "FATAL: Unhandled script exception: $($_.Exception.Message)" -ForegroundColor Red
+    }
     $scriptExitCode = 1
 } finally {
-    if (-not [string]::IsNullOrEmpty($script:LogFilePath)) {
+    if (-not $JsonProgress -and -not [string]::IsNullOrEmpty($script:LogFilePath)) {
         Write-Host ""
         Write-Host "Full build log available at: $script:LogFilePath" -ForegroundColor Cyan
     }
 
-    if (-not $Gui -and -not $NoPause) {
+    if (-not $JsonProgress -and -not $Gui -and -not $ClassicGui -and -not $NoPause) {
         Write-Host ""
         $null = Read-Host "Press Enter to close"
     }
