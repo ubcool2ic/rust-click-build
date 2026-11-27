@@ -1,0 +1,27 @@
+[package]
+name = "rcb-gui"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Native rtk front-end for rust-click-build's build.ps1"
+
+[lib]
+name = "rcb_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rcb-gui"
+path = "src/main.rs"
+
+[features]
+default = ["folder-picker"]
+# Uses rtk's folder picker for the "Browse..." button. If a future rtk changes
+# that call, build with `--no-default-features` (falls back to a text prompt).
+folder-picker = []
+
+[dependencies]
+rtk = { git = "https://github.com/ubcool2ic/rtk", tag = "v1.2.0" }
+serde_json = "1"
+
+[workspace]

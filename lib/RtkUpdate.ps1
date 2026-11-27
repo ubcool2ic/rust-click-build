@@ -16,8 +16,12 @@
 
 # Default rtk repository. A dependency counts as rtk when its git URL points
 # at github.com/ubcool2ic/rtk (with or without .git, https or ssh).
+if (-not (Get-Command Invoke-ToolProcess -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'BuildCore.ps1')
+}
+
 $script:RtkDefaultRepoUrl = 'https://github.com/ubcool2ic/rtk'
-$script:RtkGitUrlPattern  = '(?i)github\.com[:/]+ubcool2ic/rtk(\.git)?/?$'
+$script:RtkGitUrlPattern  = '(?i)^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)ubcool2ic/rtk(?:\.git)?/?$'
 $script:RtkApiTagsUrl     = 'https://api.github.com/repos/ubcool2ic/rtk/tags?per_page=100'
 $script:RtkLatestCache    = @{}
 
@@ -97,7 +101,8 @@ function Test-RtkGitUrl {
 #>
 function Get-TomlKeyValue {
     param([string]$Text, [string]$Key)
-    $m = [regex]::Match($Text, "(?:^|[\s,{])$Key\s*=\s*(?:`"([^`"]*)`"|'([^']*)')")
+    $keyPat = [regex]::Escape($Key)
+    $m = [regex]::Match($Text, "(?:^|[\s,{])$keyPat\s*=\s*(?:`"([^`"]*)`"|'([^']*)')")
     if (-not $m.Success) { return $null }
     if ($m.Groups[1].Success) { return $m.Groups[1].Value }
     return $m.Groups[2].Value
@@ -226,10 +231,9 @@ function Get-ProjectManifestSet {
     $root = Split-Path -Parent $ManifestPath
     $list = New-Object System.Collections.Generic.List[string]
     $list.Add($ManifestPath)
-    $all = Get-ChildItem -LiteralPath $root -Filter 'Cargo.toml' -Recurse -File -Force -ErrorAction SilentlyContinue
+    $all = Get-CargoTomlFiles -RootDirectory $root
     foreach ($f in $all) {
         if ($f.FullName -eq $ManifestPath) { continue }
-        if ($f.FullName -match '[\\/](target|\.git|node_modules|_built)[\\/]') { continue }
         $list.Add($f.FullName)
     }
     return $list.ToArray()
@@ -268,26 +272,10 @@ function Set-RtkTagPin {
 #>
 function Invoke-RtkProcess {
     param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec = 45)
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FilePath
-    $psi.Arguments = ($ArgumentList | ForEach-Object { if ($_ -match '\s|"') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    # Never block on a username/password prompt: no credentials = warn and go on.
-    $psi.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
-    $psi.EnvironmentVariables['GCM_INTERACTIVE'] = 'never'
-    $p = New-Object System.Diagnostics.Process
-    $p.StartInfo = $psi
-    $p.Start() | Out-Null
-    $outTask = $p.StandardOutput.ReadToEndAsync()
-    $errTask = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-        try { $p.Kill() } catch { $null = $_ }
-        return [PSCustomObject]@{ ExitCode = -1; StdOut = ''; StdErr = "timed out after ${TimeoutSec}s"; TimedOut = $true }
-    }
-    return [PSCustomObject]@{ ExitCode = $p.ExitCode; StdOut = $outTask.Result; StdErr = $errTask.Result; TimedOut = $false }
+    $r = Invoke-ToolProcess -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutSec $TimeoutSec
+    $err = $r.StdErr
+    if ($r.TimedOut -and [string]::IsNullOrEmpty($err)) { $err = "timed out after ${TimeoutSec}s" }
+    return [PSCustomObject]@{ ExitCode = $r.ExitCode; StdOut = $r.StdOut; StdErr = $err; TimedOut = $r.TimedOut }
 }
 
 <#
@@ -300,7 +288,7 @@ function Invoke-RtkLsRemote {
     if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) {
         return [PSCustomObject]@{ ExitCode = 127; StdOut = ''; StdErr = 'git is not installed or not on PATH'; TimedOut = $false }
     }
-    return Invoke-RtkProcess -FilePath 'git' -ArgumentList @('ls-remote', '--tags', $RepoUrl)
+    return Invoke-RtkProcess -FilePath 'git' -ArgumentList @('ls-remote', '--tags', '--', $RepoUrl)
 }
 
 <#
@@ -310,8 +298,17 @@ function Invoke-RtkLsRemote {
 function Invoke-RtkTagApi {
     param([string]$Token)
     $headers = @{ Authorization = "Bearer $Token"; 'User-Agent' = 'rust-click-build'; Accept = 'application/vnd.github+json' }
-    $resp = Invoke-RestMethod -Uri $script:RtkApiTagsUrl -Headers $headers -TimeoutSec 30 -ErrorAction Stop
-    return @($resp | ForEach-Object { [PSCustomObject]@{ Name = $_.name; Sha = $_.commit.sha } })
+    $all = New-Object System.Collections.Generic.List[object]
+    $base = ($script:RtkApiTagsUrl -split '\?')[0]
+    for ($page = 1; $page -le 10; $page++) {
+        $uri = "${base}?per_page=100&page=$page"
+        $resp = @(Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30 -ErrorAction Stop)
+        foreach ($item in $resp) {
+            $all.Add([PSCustomObject]@{ Name = $item.name; Sha = $item.commit.sha })
+        }
+        if ($resp.Count -lt 100) { break }
+    }
+    return $all.ToArray()
 }
 
 <#
@@ -343,8 +340,19 @@ function Get-RtkLatestRelease {
 
     $errors = New-Object System.Collections.Generic.List[string]
     $result = $null
+    $urls = New-Object System.Collections.Generic.List[string]
+    if (Test-RtkGitUrl $RepoUrl) {
+        $urls.Add($script:RtkDefaultRepoUrl)
+        $trimmed = $RepoUrl.Trim().TrimEnd('/')
+        if ($trimmed -ne $script:RtkDefaultRepoUrl -and $trimmed -ne ($script:RtkDefaultRepoUrl + '.git')) {
+            $urls.Add($RepoUrl)
+        }
+    } else {
+        $urls.Add($RepoUrl)
+    }
+    foreach ($tryUrl in $urls) {
     try {
-        $ls = Invoke-RtkLsRemote -RepoUrl $RepoUrl
+        $ls = Invoke-RtkLsRemote -RepoUrl $tryUrl
         if ($ls.ExitCode -eq 0) {
             $map = ConvertFrom-LsRemoteTag $ls.StdOut
             $latest = Select-RtkLatestTag @($map.Keys)
@@ -356,6 +364,8 @@ function Get-RtkLatestRelease {
             $errors.Add("git ls-remote failed (exit $($ls.ExitCode)): $msg")
         }
     } catch { $errors.Add("git ls-remote error: $($_.Exception.Message)") }
+        if ($null -ne $result) { break }
+    }
 
     if ($null -eq $result) {
         $token = $env:GH_TOKEN
@@ -376,6 +386,7 @@ function Get-RtkLatestRelease {
 
     if ($null -eq $result) {
         $result = [PSCustomObject]@{ Tag = $null; Sha = $null; Source = $null; TagShas = @{}; Error = ($errors -join '; ') }
+        return $result
     }
     $script:RtkLatestCache[$RepoUrl] = $result
     return $result
@@ -411,10 +422,22 @@ function Backup-RtkFile {
 #>
 function Restore-RtkBackup {
     param([PSCustomObject[]]$Pairs)
-    foreach ($p in $Pairs) {
-        if ($p.Existed) { Copy-Item -LiteralPath $p.Backup -Destination $p.Original -Force }
-        elseif (Test-Path -LiteralPath $p.Original) { Remove-Item -LiteralPath $p.Original -Force }
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @($Pairs)) {
+        foreach ($attempt in 1..3) {
+            try {
+                if ($p.Existed) { Copy-Item -LiteralPath $p.Backup -Destination $p.Original -Force -ErrorAction Stop }
+                elseif (Test-Path -LiteralPath $p.Original) { Remove-Item -LiteralPath $p.Original -Force -ErrorAction Stop }
+                break
+            } catch {
+                Start-Sleep -Milliseconds (50 * $attempt)
+                if ($attempt -eq 3) { $failures.Add("$($p.Original): $($_.Exception.Message)") }
+            }
+        }
     }
+    # Return the list object itself so an empty result is not wrapped into a
+    # one-element array by the unary comma / @() idiom.
+    return $failures
 }
 
 <#
@@ -509,8 +532,13 @@ function Invoke-RtkUpdateCheck {
 
     # Back up every manifest we might touch plus the lockfile, then update.
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
-    $backupDir = Join-Path $BackupRoot ("rtk-backup-$stamp-" + (Split-Path -Leaf $projDir))
-    $files = @($toBump | ForEach-Object { $_.ManifestPath }) + @(Join-Path $projDir 'Cargo.lock')
+    $leaf = Split-Path -Leaf $projDir
+    $suffix = 0
+    do {
+        $suffix++
+        $backupDir = Join-Path $BackupRoot ("rtk-backup-$stamp-$leaf-$suffix")
+    } while (Test-Path -LiteralPath $backupDir)
+    $files = @($toBump | ForEach-Object { $_.ManifestPath }) + @(Get-CargoLockPath -ManifestPath $ManifestPath)
     $res.Backup = Backup-RtkFile -Files $files -BackupDir $backupDir
     & $say "  rtk: backed up Cargo.toml/Cargo.lock to $backupDir" 'muted'
 
@@ -530,8 +558,17 @@ function Invoke-RtkUpdateCheck {
         return $res
     }
 
-    $upd = Invoke-RtkCargoUpdate -ManifestPath $ManifestPath -WorkingDirectory $projDir
-    if ($upd.ExitCode -ne 0) {
+    $upd = $null
+    try {
+        $upd = Invoke-RtkCargoUpdate -ManifestPath $ManifestPath -WorkingDirectory $projDir
+    } catch {
+        & $say "  rtk: 'cargo update -p rtk' threw: $($_.Exception.Message). Restoring backup." 'danger'
+        $null = Restore-RtkBackup -Pairs $res.Backup
+        $res.Status = 'update failed; kept old pins'
+        $res.Warnings = @($_.Exception.Message)
+        return $res
+    }
+    if ($null -eq $upd -or $upd.ExitCode -ne 0) {
         $first = ($upd.Lines | Where-Object { $_ -match 'error' } | Select-Object -First 3) -join ' | '
         & $say "  rtk: 'cargo update -p rtk' failed: $first" 'danger'
         & $say '  rtk: restoring the backup and continuing on the old pins.' 'warning'

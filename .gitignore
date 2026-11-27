@@ -1,0 +1,4 @@
+/gui/target/
+/_built/
+*.exe
+.DS_Store
