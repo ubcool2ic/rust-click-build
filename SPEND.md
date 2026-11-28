@@ -42,7 +42,8 @@ PR #2 Fable subtotal: **$29.2371**. PR #2 documented total including the origina
 |---|---|---|---|---|
 | 2026-11-27 | America/Indianapolis (ET) | none (hand-written) | Fold PR #2 fixes into PR #3; Reviewer1 M/S/N fixes; tests and lint | $0.0000 |
 | 2026-11-27 | America/Indianapolis (ET) | none (hand-written) | Optional Authenticode signing (`-Sign`, rtk GUI, tests, docs, screenshots) | $0.0000 |
+| 2026-11-27 | America/Indianapolis (ET) | none (hand-written) | Reviewer1 r2 should-fixes (S1–S4 + nits, tests, docs) | $0.0000 |
 
-No further paid OpenRouter / Fable calls were made for the fold or for signing. Job cap for the 2026-11-27 Fable 5.2 check remains **$5.00**; job sum stays **$2.203904**.
+No further paid OpenRouter / Fable calls were made for the fold, signing, or Reviewer1 r2 should-fixes. Job cap for the 2026-11-27 Fable 5.2 check remains **$5.00**; job sum stays **$2.203904**.
 
-**This branch's first table total (2026-10 rows + 2026-11-27 Fable): $2.253404.** Historical PR #2 Fable spend recorded above is **$29.2371** (the 2026-10-17 and 2026-10-26 rows are not counted twice). Fold + signing: **$0**.
+**This branch's first table total (2026-10 rows + 2026-11-27 Fable): $2.253404.** Historical PR #2 Fable spend recorded above is **$29.2371** (the 2026-10-17 and 2026-10-26 rows are not counted twice). Fold + signing + r2 should-fixes: **$0**.

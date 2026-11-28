@@ -116,7 +116,11 @@ function ConvertTo-RcbRelaunchArgument {
     $list = New-Object System.Collections.Generic.List[string]
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $list.Add('-NoProfile')
-    if ($HostPath -match '\.exe$') { $list.Add('-STA') }
+    if ($HostPath -match '\.exe$') {
+        $list.Add('-STA')
+        $list.Add('-ExecutionPolicy')
+        $list.Add('Bypass')
+    }
     $list.Add('-File')
     $list.Add($ScriptPath)
     if ($null -ne $BoundParameters) {
@@ -374,7 +378,7 @@ function Test-And-InstallPrereqs {
                     }
                     $subject = ''
                     try { $subject = [string]$sig.SignerCertificate.Subject } catch { $subject = '' }
-                    if ($subject -notmatch 'Rust') {
+                    if (-not (Test-RcbRustupSignerSubject -Subject $subject)) {
                         Write-BuildLog "rustup-init signer is not the Rust Foundation ($subject); not running it." -ForegroundColor Red -UiCallback $UiLog
                         return $false
                     }
@@ -643,6 +647,9 @@ function Start-BuildPipeline {
                 $signSettings.Tool = $tool.Path
                 $signSettings.ToolKind = $tool.Kind
                 Write-BuildLog "sign: using $($tool.Kind) at $($tool.Path)" -Role muted -UiCallback $UiLog
+            }
+            if ($signSettings.TimestampHttpWarning) {
+                Write-BuildLog "sign: timestamp URL is not HTTPS ($($signSettings.TimestampUrl)). RFC 3161 tokens are still signed, so HTTP is allowed; prefer https:// if the TSA offers it." -Role warning -UiCallback $UiLog
             }
         }
         Write-RcbEvent 'start' ([ordered]@{ version = 1; path = $resolvedPath; profile = $ActiveProfile; test = $RunTests; rtk_update = (-not $NoRtkUpdateFlag); sign = [bool]$signSettings.Enabled; log_file = $script:LogFilePath })
@@ -925,6 +932,7 @@ function Start-BuildPipeline {
                     $signStatus = Get-RcbSignSummary -Results $signResults
                     if ($signResults.Count -eq 0) { $signStatus = 'skipped' }
                 }
+                if ($signStatus -eq 'SIGN FAILED') { $overallSuccess = $false }
             }
 
             $buildEvt = if ($buildPassed) { "PASS" } else { "FAIL" }

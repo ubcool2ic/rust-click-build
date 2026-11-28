@@ -115,6 +115,28 @@ Describe 'Restore-RtkBackup and cargo-update throw' {
         $r.Status | Should -Match 'cargo update -p rtk failed; kept'
         Get-Content -Raw (Join-Path $dir 'Cargo.toml') | Should -Be $before
     }
+
+    It 'restores the workspace-root Cargo.lock when cargo update fails on a member crate' {
+        Mock Invoke-RtkLsRemote { [PSCustomObject]@{ ExitCode = 0; StdOut = "85125ab0d7efaa8b37279e10276a9b60e826901a`trefs/tags/v1.0.1`n"; StdErr = '' } }
+        $ws = Copy-Fixture 'workspace'
+        $rootLock = Join-Path $ws 'Cargo.lock'
+        Set-Content -LiteralPath $rootLock -Value "root-lock-v1`n"
+        $memberLock = Join-Path $ws 'app/Cargo.lock'
+        Set-Content -LiteralPath $memberLock -Value "member-lock-should-not-be-backed-up`n"
+        $script:WsRootForLock = $ws
+        Mock Invoke-RtkCargoUpdate {
+            Set-Content -LiteralPath (Join-Path $script:WsRootForLock 'Cargo.lock') -Value "mutated-by-failed-update`n"
+            throw 'cargo update failed'
+        }
+        $script:RtkLatestCache = @{}
+        $r = Invoke-RtkUpdateCheck -ManifestPath (Join-Path $ws 'widgets/Cargo.toml') -BackupRoot (Join-Path $ws '_built')
+        $r.Changed | Should -BeFalse
+        $r.Status | Should -Match 'cargo update -p rtk failed; kept'
+        (Get-Content -Raw -LiteralPath $rootLock).Trim() | Should -Be 'root-lock-v1'
+        $origs = @($r.Backup | ForEach-Object { $_.Original })
+        $origs | Should -Contain $rootLock
+        $origs | Should -Not -Contain $memberLock
+    }
 }
 
 Describe 'failed tag lookup is not cached' {

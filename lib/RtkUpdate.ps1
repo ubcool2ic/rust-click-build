@@ -1240,8 +1240,8 @@ function Backup-RtkFile {
 <#
 .SYNOPSIS
     Puts backed-up files back (and removes a Cargo.lock that did not exist
-    before). Every pair is attempted; failures are collected and thrown
-    together at the end.
+    before). Every pair is attempted; failures are returned as a list (callers
+    should wrap the result with @()). This function does not throw the list.
 #>
 function Restore-RtkBackup {
     param([PSCustomObject[]]$Pairs)
@@ -1376,7 +1376,8 @@ function Invoke-RtkUpdateCheck {
     $backupDir = $null
     try {
         $backupDir = New-RtkBackupDirectory -BackupRoot $BackupRoot -ProjectName (Split-Path -Leaf $projDir)
-        $files = @($toBump | ForEach-Object { $_.ManifestPath }) + @([System.IO.Path]::Combine($projDir, 'Cargo.lock'))
+        $lockPath = Get-CargoLockPath -ManifestPath $ManifestPath
+        $files = @($toBump | ForEach-Object { $_.ManifestPath }) + @($lockPath)
         $res.Backup = Backup-RtkFile -Files $files -BackupDir $backupDir
     } catch {
         $why = Get-RcbErrorText $_.Exception

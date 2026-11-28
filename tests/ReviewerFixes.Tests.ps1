@@ -20,6 +20,8 @@ Describe 'M1 Build.bat path quoting' {
         $bat | Should -Match 'goto :switches'
         $bat | Should -Match '%A1:~0,1%'
         $bat | Should -Match '-Path "%~1"'
+        $bat | Should -Not -Match '%2 %3 %4 %5 %6 %7 %8 %9'
+        $bat | Should -Match '"%~2"'
     }
 }
 
@@ -83,6 +85,21 @@ Describe 'S1 grandchild holding pipes does not hang or false-timeout' {
         $sw.Elapsed.TotalSeconds | Should -BeLessThan 8
         $r.StdOut | Should -Match 'ok'
     }
+    It 'kills leftover grandchildren after the parent exits' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
+        $pidfile = Join-Path $TestDrive 'grandchild.pid'
+        $r = Invoke-ToolProcess -FilePath '/bin/sh' -ArgumentList @('-c', "sleep 25 & echo `$`! > `"$pidfile`"; sleep 0.5; exit 0") -TimeoutSec 0
+        $r.ExitCode | Should -Be 0
+        $r.TimedOut | Should -BeFalse
+        Test-Path -LiteralPath $pidfile | Should -BeTrue
+        $gp = (Get-Content -LiteralPath $pidfile -Raw).Trim()
+        $gp | Should -Match '^[0-9]+$'
+        $alive = $false
+        try {
+            $pr = [System.Diagnostics.Process]::GetProcessById([int]$gp)
+            $alive = -not $pr.HasExited
+        } catch { $alive = $false }
+        $alive | Should -BeFalse
+    }
     It 'times out a still-running child and kills the tree, without marking a successful exit TimedOut' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $r = Invoke-ToolProcess -FilePath '/bin/sh' -ArgumentList @('-c', 'echo go; sleep 30') -TimeoutSec 2
@@ -104,7 +121,13 @@ Describe 'S2 STA relaunch forwards script-level parameters' {
         }
         $args = ConvertTo-RcbRelaunchArgument -BoundParameters $bound -ScriptPath '/tmp/build.ps1' -HostPath 'powershell.exe'
         $args | Should -Contain '-STA'
+        $args | Should -Contain '-ExecutionPolicy'
+        $args | Should -Contain 'Bypass'
+        $sta = [array]::IndexOf($args, '-STA')
+        $args[$sta + 1] | Should -Be '-ExecutionPolicy'
+        $args[$sta + 2] | Should -Be 'Bypass'
         $args | Should -Contain '-File'
+        [array]::IndexOf($args, '-File') | Should -BeGreaterThan ($sta + 2)
         $i = [array]::IndexOf($args, '-Path')
         $i | Should -BeGreaterThan 0
         $args[$i + 1] | Should -Be '/tmp/my projects'
@@ -118,6 +141,8 @@ Describe 'S2 STA relaunch forwards script-level parameters' {
     It 'omits -STA for a non-Windows pwsh host' {
         $args = ConvertTo-RcbRelaunchArgument -BoundParameters @{} -ScriptPath '/tmp/build.ps1' -HostPath '/usr/bin/pwsh'
         $args | Should -Not -Contain '-STA'
+        $args | Should -Not -Contain '-ExecutionPolicy'
+        $args | Should -Not -Contain 'Bypass'
         $args | Should -Contain '-File'
     }
     It 'does not duplicate -ClassicGui when it is already in Extra' {
@@ -226,3 +251,17 @@ Describe 'N10 GUI launch does not auto-bump gui/Cargo.toml' {
         $src | Should -Not -Match 'Start-BuildPipeline -TargetFolder \$guiDir'
     }
 }
+
+Describe 'Test-RcbRustupSignerSubject' {
+    It 'accepts the exact Rust Foundation CN or O' {
+        Test-RcbRustupSignerSubject -Subject 'CN=Rust Foundation, O=Rust Foundation' | Should -BeTrue
+        Test-RcbRustupSignerSubject -Subject 'CN=The Rust Foundation' | Should -BeTrue
+        Test-RcbRustupSignerSubject -Subject 'O=The Rust Foundation, C=US' | Should -BeTrue
+    }
+    It 'rejects a subject that only contains the substring Rust' {
+        Test-RcbRustupSignerSubject -Subject 'CN=Trust Rust LLC, OU=Rust' | Should -BeFalse
+        Test-RcbRustupSignerSubject -Subject 'CN=Someone, OU=Rust Tools' | Should -BeFalse
+        Test-RcbRustupSignerSubject -Subject '' | Should -BeFalse
+    }
+}
+

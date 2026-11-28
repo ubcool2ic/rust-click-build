@@ -149,7 +149,9 @@ Describe 'Fixes2 build.ps1' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
             $sta = [array]::IndexOf($a, '-STA')
             $file = [array]::IndexOf($a, '-File')
             $sta | Should -BeGreaterThan -1
-            $file | Should -BeGreaterThan $sta
+            $a[$sta + 1] | Should -Be '-ExecutionPolicy'
+            $a[$sta + 2] | Should -Be 'Bypass'
+            $file | Should -BeGreaterThan ($sta + 2)
             $a[$file + 1] | Should -Be '/x/build.ps1'
             $a[$a.Count - 1] | Should -Be '-ClassicGui'
         }
@@ -157,6 +159,8 @@ Describe 'Fixes2 build.ps1' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
         It 'omits -STA for a non-Windows pwsh host' {
             $a = @(ConvertTo-RcbRelaunchArgument -BoundParameters @{} -ScriptPath '/x/build.ps1' -HostPath '/usr/bin/pwsh')
             $a | Should -Not -Contain '-STA'
+            $a | Should -Not -Contain '-ExecutionPolicy'
+            $a | Should -Not -Contain 'Bypass'
             $a | Should -Contain '-File'
         }
     }

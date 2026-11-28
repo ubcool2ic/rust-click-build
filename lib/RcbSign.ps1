@@ -1,6 +1,10 @@
 # Optional Authenticode signing of collected _built artifacts.
 # The PFX password is read only from $env:RCB_SIGN_PFX_PASSWORD. It is never
-# written to a log, a file, or the configuration JSON.
+# logged, never committed, never put on a child command line, and never stored
+# in rcb.sign.json. On Windows a PFX is loaded in-process and signed with
+# /sha1 after a temporary CurrentUser\My import (removed in finally). For
+# osslsigncode the password is written to a 0600 temp file passed as -readpass
+# and that file is deleted in finally.
 
 $script:RcbDefaultTimestampUrl = 'http://timestamp.digicert.com'
 $script:RcbSignConfigName = 'rcb.sign.json'
@@ -48,8 +52,10 @@ function Resolve-RcbSignConfigPath {
 
 <#
 .SYNOPSIS
-    Merges CLI signing options with rcb.sign.json. CLI wins. Password is never
-    taken from the file.
+    Merges CLI / GUI signing options with rcb.sign.json defaults (thumbprint,
+    PFX path, timestamp URL). Signing is enabled only by -Sign / the GUI
+    toggle; a "sign": true field in the file cannot turn it on. Password is
+    never taken from the file.
 #>
 function Get-RcbSignSettings {
     param(
@@ -66,10 +72,10 @@ function Get-RcbSignSettings {
     if (-not [string]::IsNullOrWhiteSpace($cfgPath)) {
         $cfg = Read-RcbSignConfigFile -Path $cfgPath
     }
-    $enabled = $SignFlag
-    if (-not $enabled -and $null -ne $cfg -and $cfg.PSObject.Properties['sign'] -and [bool]$cfg.sign) {
-        $enabled = $true
-    }
+    # Config supplies defaults only. -Sign / the GUI "Sign output" toggle is
+    # the only way to enable signing, so a toggle-off (or a CLI run without
+    # -Sign) always wins over rcb.sign.json.
+    $enabled = [bool]$SignFlag
     $thumb = $CertThumbprint
     if ([string]::IsNullOrWhiteSpace($thumb) -and $null -ne $cfg) { $thumb = [string]$cfg.certThumbprint }
     $pfx = $PfxPath
@@ -77,15 +83,104 @@ function Get-RcbSignSettings {
     $ts = $TimestampUrl
     if ([string]::IsNullOrWhiteSpace($ts) -and $null -ne $cfg) { $ts = [string]$cfg.timestampUrl }
     if ([string]::IsNullOrWhiteSpace($ts)) { $ts = $script:RcbDefaultTimestampUrl }
+    $normThumb = Get-RcbNormalizedThumbprint -Value $thumb
+    $thumbError = $null
+    if (-not [string]::IsNullOrWhiteSpace($thumb) -and $null -eq $normThumb) {
+        $thumbError = 'certificate thumbprint must be 40 hexadecimal characters'
+    } elseif (-not [string]::IsNullOrWhiteSpace($normThumb)) {
+        $thumb = $normThumb
+    }
+    $ts = ([string]$ts).Trim()
+    $tsWarn = (-not [string]::IsNullOrWhiteSpace($ts) -and $ts -notmatch '^[Hh][Tt][Tt][Pp][Ss]://')
     return [PSCustomObject]@{
         Enabled        = [bool]$enabled
         CertThumbprint = ([string]$thumb).Trim()
         PfxPath        = ([string]$pfx).Trim()
-        TimestampUrl   = ([string]$ts).Trim()
+        TimestampUrl   = $ts
+        TimestampHttpWarning = [bool]$tsWarn
         ConfigPath     = $cfgPath
         Tool           = $null
         ToolKind       = $null
-        Error          = $null
+        Error          = $thumbError
+    }
+}
+
+function Get-RcbNormalizedThumbprint {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $hex = ([string]$Value).Trim() -replace '[\s:]',''
+    if ($hex -notmatch '^[0-9A-Fa-f]{40}$') { return $null }
+    return $hex.ToUpperInvariant()
+}
+
+function Test-RcbCertThumbprint {
+    param([string]$Value)
+    $n = Get-RcbNormalizedThumbprint -Value $Value
+    return (-not [string]::IsNullOrWhiteSpace($n))
+}
+
+function Import-RcbPfxCertificate {
+    param([string]$PfxPath, [string]$Password)
+    $result = [PSCustomObject]@{
+        Thumbprint  = $null
+        Temporary   = $false
+        Store       = $null
+        Certificate = $null
+        Error       = $null
+    }
+    if ($null -ne $script:RcbPfxImportHook) {
+        return & $script:RcbPfxImportHook $PfxPath $Password
+    }
+    $isWin = ($script:IsWindowsOS -or $env:OS -eq 'Windows_NT')
+    if (-not $isWin) {
+        $result.Error = 'PFX signing with signtool requires Windows so the certificate can be imported into CurrentUser\My and used with /sha1 (the password is never passed on the command line).'
+        return $result
+    }
+    try {
+        $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet
+        try {
+            # PersistKeySet is required so signtool can find the private key.
+            # EphemeralKeySet keeps the key out of disk, but signtool cannot
+            # see an in-process-only key, so a temporary store import is used.
+            $flags = $flags -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet
+        } catch { $null = $_ }
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($PfxPath, $Password, $flags)
+        $thumb = [string]$cert.Thumbprint
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('My', 'CurrentUser')
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $existing = $store.Certificates.Find([System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $thumb, $false)
+        $temporary = $false
+        if ($existing.Count -eq 0) {
+            $store.Add($cert)
+            $temporary = $true
+        }
+        $result.Thumbprint = $thumb
+        $result.Temporary = $temporary
+        $result.Store = $store
+        $result.Certificate = $cert
+        return $result
+    } catch {
+        $msg = $_.Exception.Message
+        if (-not [string]::IsNullOrEmpty($Password)) { $msg = $msg.Replace($Password, '<redacted>') }
+        $result.Error = $msg
+        return $result
+    }
+}
+
+function Remove-RcbTemporaryPfxCertificate {
+    param($Import)
+    if ($null -eq $Import) { return }
+    try {
+        if ($Import.Temporary -and $null -ne $Import.Store -and $null -ne $Import.Certificate) {
+            try { $Import.Store.Remove($Import.Certificate) } catch { $null = $_ }
+        }
+    } finally {
+        if ($null -ne $Import.Store) {
+            try { $Import.Store.Close() } catch { $null = $_ }
+        }
+        if ($null -ne $Import.Certificate) {
+            try { $Import.Certificate.Dispose() } catch { $null = $_ }
+        }
     }
 }
 
@@ -159,6 +254,13 @@ function Invoke-RcbSignOneFile {
     if (-not $hasThumb -and -not $hasPfx) {
         return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = 'no certificate: set -CertThumbprint or -PfxPath (PFX password: RCB_SIGN_PFX_PASSWORD)' }
     }
+    if ($hasThumb) {
+        $norm = Get-RcbNormalizedThumbprint -Value $Settings.CertThumbprint
+        if ([string]::IsNullOrWhiteSpace($norm)) {
+            return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = 'certificate thumbprint must be 40 hexadecimal characters' }
+        }
+        $Settings.CertThumbprint = $norm
+    }
     if ($hasPfx -and -not (Test-Path -LiteralPath $Settings.PfxPath -PathType Leaf)) {
         return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = "PFX file not found: $($Settings.PfxPath)" }
     }
@@ -171,77 +273,104 @@ function Invoke-RcbSignOneFile {
     $kind = [string]$Settings.ToolKind
     $args = New-Object System.Collections.Generic.List[string]
     $outFile = $null
-    if ($kind -eq 'osslsigncode') {
-        $outFile = $FilePath + '.signed-tmp'
-        $args.Add('sign')
-        if ($hasPfx) {
-            $args.Add('-pkcs12'); $args.Add($Settings.PfxPath)
-            $args.Add('-pass'); $args.Add($pfxPass)
+    $passFile = $null
+    $imported = $null
+    try {
+        if ($kind -eq 'osslsigncode') {
+            $outFile = $FilePath + '.signed-tmp'
+            $args.Add('sign')
+            if ($hasPfx) {
+                $passFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ('rcb-sign-' + [guid]::NewGuid().ToString('N') + '.pass'))
+                $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+                [System.IO.File]::WriteAllText($passFile, $pfxPass, $utf8NoBom)
+                try {
+                    if (-not ($script:IsWindowsOS -or $env:OS -eq 'Windows_NT')) {
+                        & /bin/chmod 600 $passFile
+                    }
+                } catch { $null = $_ }
+                $args.Add('-pkcs12'); $args.Add($Settings.PfxPath)
+                $args.Add('-readpass'); $args.Add($passFile)
+            } else {
+                return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = 'osslsigncode signing requires -PfxPath' }
+            }
+            $args.Add('-h'); $args.Add('sha256')
+            if (-not [string]::IsNullOrWhiteSpace($Settings.TimestampUrl)) {
+                $args.Add('-ts'); $args.Add($Settings.TimestampUrl)
+            }
+            $args.Add('-in'); $args.Add($FilePath)
+            $args.Add('-out'); $args.Add($outFile)
         } else {
-            return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = 'osslsigncode signing requires -PfxPath' }
+            $sha1 = $null
+            if ($hasThumb) {
+                $sha1 = $Settings.CertThumbprint
+            } elseif ($hasPfx) {
+                $imported = Import-RcbPfxCertificate -PfxPath $Settings.PfxPath -Password $pfxPass
+                if ([string]::IsNullOrWhiteSpace($imported.Thumbprint)) {
+                    $err = $imported.Error
+                    if ([string]::IsNullOrWhiteSpace($err)) { $err = 'could not import the PFX certificate' }
+                    return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = $err }
+                }
+                $sha1 = $imported.Thumbprint
+            }
+            $args.Add('sign')
+            $args.Add('/fd'); $args.Add('SHA256')
+            if (-not [string]::IsNullOrWhiteSpace($Settings.TimestampUrl)) {
+                $args.Add('/tr'); $args.Add($Settings.TimestampUrl)
+                $args.Add('/td'); $args.Add('SHA256')
+            }
+            $args.Add('/sha1'); $args.Add($sha1)
+            $args.Add($FilePath)
         }
-        $args.Add('-h'); $args.Add('sha256')
-        if (-not [string]::IsNullOrWhiteSpace($Settings.TimestampUrl)) {
-            $args.Add('-ts'); $args.Add($Settings.TimestampUrl)
+
+        & $say ("  sign: " + (Get-RcbRedactedSignArgs -ArgumentList $args.ToArray())) 'muted'
+        $run = Invoke-ToolProcess -FilePath $tool -ArgumentList $args.ToArray() -TimeoutSec 120 -RemoveEnvironment @('RCB_SIGN_PFX_PASSWORD')
+        if ($run.ExitCode -ne 0) {
+            $err = $run.StdErr
+            if ([string]::IsNullOrWhiteSpace($err)) { $err = $run.StdOut }
+            if ([string]::IsNullOrWhiteSpace($err)) { $err = "sign tool exited $($run.ExitCode)" }
+            if (-not [string]::IsNullOrEmpty($pfxPass)) { $err = $err.Replace($pfxPass, '<redacted>') }
+            if ($outFile -and (Test-Path -LiteralPath $outFile)) { Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue }
+            return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = $err.Trim() }
         }
-        $args.Add('-in'); $args.Add($FilePath)
-        $args.Add('-out'); $args.Add($outFile)
-    } else {
-        $args.Add('sign')
-        $args.Add('/fd'); $args.Add('SHA256')
-        if (-not [string]::IsNullOrWhiteSpace($Settings.TimestampUrl)) {
-            $args.Add('/tr'); $args.Add($Settings.TimestampUrl)
-            $args.Add('/td'); $args.Add('SHA256')
+        if ($outFile) {
+            try {
+                [System.IO.File]::Copy($outFile, $FilePath, $true)
+                Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+            } catch {
+                $msg = $_.Exception.Message
+                if (-not [string]::IsNullOrEmpty($pfxPass)) { $msg = $msg.Replace($pfxPass, '<redacted>') }
+                return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = $msg }
+            }
         }
-        if ($hasThumb) {
-            $args.Add('/sha1'); $args.Add($Settings.CertThumbprint)
+
+        $vArgs = New-Object System.Collections.Generic.List[string]
+        if ($kind -eq 'osslsigncode') {
+            $vArgs.Add('verify'); $vArgs.Add('-in'); $vArgs.Add($FilePath)
         } else {
-            $args.Add('/f'); $args.Add($Settings.PfxPath)
-            $args.Add('/p'); $args.Add($pfxPass)
+            $vArgs.Add('verify'); $vArgs.Add('/pa'); $vArgs.Add($FilePath)
         }
-        $args.Add($FilePath)
-    }
-
-    & $say ("  sign: " + (Get-RcbRedactedSignArgs -ArgumentList $args.ToArray())) 'muted'
-    $run = Invoke-ToolProcess -FilePath $tool -ArgumentList $args.ToArray() -TimeoutSec 120
-    if ($run.ExitCode -ne 0) {
-        $err = $run.StdErr
-        if ([string]::IsNullOrWhiteSpace($err)) { $err = $run.StdOut }
-        if ([string]::IsNullOrWhiteSpace($err)) { $err = "sign tool exited $($run.ExitCode)" }
-        if (-not [string]::IsNullOrEmpty($pfxPass)) { $err = $err.Replace($pfxPass, '<redacted>') }
-        if ($outFile -and (Test-Path -LiteralPath $outFile)) { Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue }
-        return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = $err.Trim() }
-    }
-    if ($outFile) {
-        try {
-            [System.IO.File]::Copy($outFile, $FilePath, $true)
-            Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
-        } catch {
-            return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = $_.Exception.Message }
+        $ver = Invoke-ToolProcess -FilePath $tool -ArgumentList $vArgs.ToArray() -TimeoutSec 60 -RemoveEnvironment @('RCB_SIGN_PFX_PASSWORD')
+        if ($ver.ExitCode -ne 0) {
+            $err = $ver.StdErr
+            if ([string]::IsNullOrWhiteSpace($err)) { $err = $ver.StdOut }
+            if ([string]::IsNullOrWhiteSpace($err)) { $err = "signtool verify /pa failed (exit $($ver.ExitCode))" }
+            if (-not [string]::IsNullOrEmpty($pfxPass)) { $err = $err.Replace($pfxPass, '<redacted>') }
+            return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = $err.Trim() }
         }
+        return [PSCustomObject]@{ File = $FilePath; Status = 'signed'; Error = $null }
+    } finally {
+        if (-not [string]::IsNullOrEmpty($passFile) -and (Test-Path -LiteralPath $passFile)) {
+            try { [System.IO.File]::WriteAllBytes($passFile, [byte[]]@()) } catch { $null = $_ }
+            try { Remove-Item -LiteralPath $passFile -Force -ErrorAction SilentlyContinue } catch { $null = $_ }
+        }
+        Remove-RcbTemporaryPfxCertificate -Import $imported
     }
-
-    $vArgs = New-Object System.Collections.Generic.List[string]
-    if ($kind -eq 'osslsigncode') {
-        $vArgs.Add('verify'); $vArgs.Add('-in'); $vArgs.Add($FilePath)
-    } else {
-        $vArgs.Add('verify'); $vArgs.Add('/pa'); $vArgs.Add($FilePath)
-    }
-    $ver = Invoke-ToolProcess -FilePath $tool -ArgumentList $vArgs.ToArray() -TimeoutSec 60
-    if ($ver.ExitCode -ne 0) {
-        $err = $ver.StdErr
-        if ([string]::IsNullOrWhiteSpace($err)) { $err = $ver.StdOut }
-        if ([string]::IsNullOrWhiteSpace($err)) { $err = "signtool verify /pa failed (exit $($ver.ExitCode))" }
-        if (-not [string]::IsNullOrEmpty($pfxPass)) { $err = $err.Replace($pfxPass, '<redacted>') }
-        return [PSCustomObject]@{ File = $FilePath; Status = 'SIGN FAILED'; Error = $err.Trim() }
-    }
-    return [PSCustomObject]@{ File = $FilePath; Status = 'signed'; Error = $null }
 }
 
 <#
 .SYNOPSIS
     Signs every .exe/.dll collected under a project's _built folder.
-    Missing tool or cert is a clear error; the build result is left alone.
+    Missing tool or cert is a clear error; a SIGN FAILED artifact fails the run.
 #>
 function Invoke-RcbSignBuiltFolder {
     param(

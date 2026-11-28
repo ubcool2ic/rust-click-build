@@ -52,18 +52,18 @@ Missing `link.exe` (MSVC), no default toolchain, no internet / crates.io downloa
 
 
 ## Signing collected programs
-Signing is **off by default**. After a project builds, `build.ps1 -Sign` can Authenticode-sign the `.exe` / `.dll` files copied into `_built`. The build result stays `PASS` or `FAIL` on its own; a signing problem is shown as `SIGN FAILED` on that row, in the GUI results table, and as a `sign` JsonProgress event.
+Signing is **off by default**. After a project builds, `build.ps1 -Sign` can Authenticode-sign the `.exe` / `.dll` files copied into `_built`. A signing problem is shown as `SIGN FAILED` on that row, in the GUI results table, and as a `sign` JsonProgress event. If `-Sign` is on and any artifact is marked `SIGN FAILED`, the run fails (exit code 1).
 
 ```
 powershell -ExecutionPolicy Bypass -File build.ps1 -Path C:\src -Sign -CertThumbprint 001122...AABB
 powershell -ExecutionPolicy Bypass -File build.ps1 -Path C:\src -Sign -PfxPath .\dev.pfx
 ```
 
-- **`-CertThumbprint`**: a code-signing certificate already in the CurrentUser or LocalMachine `My` store (signtool `/sha1`).
-- **`-PfxPath`**: a `.pfx` / `.p12` file. The password comes **only** from the environment variable `RCB_SIGN_PFX_PASSWORD`. It is never logged, never written to a file, and must not be committed.
-- Timestamping uses RFC 3161 (`signtool /tr`, `/td SHA256`, `/fd SHA256`). The default URL is `http://timestamp.digicert.com`; override it with `-TimestampUrl`.
+- **`-CertThumbprint`**: a 40-character hexadecimal SHA-1 (spaces or colons are allowed) of a code-signing certificate already in the CurrentUser or LocalMachine `My` store (signtool `/sha1`).
+- **`-PfxPath`**: a `.pfx` / `.p12` file. The password comes **only** from the environment variable `RCB_SIGN_PFX_PASSWORD`. It is never logged, never placed on a command line, and must not be committed. On Windows the PFX is loaded in-process and the file is signed with `/sha1 <thumbprint>` (a temporary CurrentUser\My import is removed in a `finally` block). For `osslsigncode`, the password is passed with `-readpass` and a `0600` temp file that is wiped and deleted in `finally`. The child process does not inherit `RCB_SIGN_PFX_PASSWORD`.
+- Timestamping uses RFC 3161 (`signtool /tr`, `/td SHA256`, `/fd SHA256`). The default URL is `http://timestamp.digicert.com`; override it with `-TimestampUrl`. A non-HTTPS URL is allowed (the token itself is signed) but the run warns once and prefers `https://` when the TSA offers it.
 - `signtool.exe` is found on PATH or in the newest `Windows Kits\10\bin\<version>\x64` (or x86 / arm64) folder. After signing, the file is checked with `signtool verify /pa`. If signtool or the certificate is missing, you get a clear error and the artifact is marked `SIGN FAILED`.
-- Optional defaults can live in `rcb.sign.json` next to the project folder or the tool (or a path passed as `-SignConfig`). That file is gitignored. It may set `sign`, `certThumbprint`, `pfxPath`, and `timestampUrl`. It must not contain a password.
+- Optional defaults can live in `rcb.sign.json` next to the project folder or the tool (or a path passed as `-SignConfig`). That file is gitignored. It may set `certThumbprint`, `pfxPath`, and `timestampUrl`. A `"sign": true` field does **not** enable signing; only `-Sign` or the GUI **Sign output** toggle does, so a toggle-off always wins. The file must not contain a password.
 
 The rtk GUI has a **Sign output** toggle and thumbprint / PFX fields (public rtk API only). The PFX password is still read from `RCB_SIGN_PFX_PASSWORD`; there is no password box. CLI `--sign`, `--cert-thumbprint`, and `--pfx-path` fill those controls.
 
@@ -90,7 +90,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -ClassicGui
 ```
 Switches: `-Path`, `-BuildProfile release|debug`, `-Test`, `-Gui`, `-ClassicGui`, `-JsonProgress`, `-NoPause`, `-NoInstall`, `-NoOpen`, `-NoRtkUpdate`, `-Sign`, `-CertThumbprint`, `-PfxPath`, `-TimestampUrl`, `-SignConfig`, `-Theme System|Light|Dark|HighContrast` (GUI).
 
-Exit codes: `0` all passed, `1` any build/test failed, `2` cancelled / invalid folder / nothing to build.
+Exit codes: `0` all passed, `1` any build/test failed or a requested sign failed, `2` cancelled / invalid folder / nothing to build.
 
 Works with Windows PowerShell 5.1 and PowerShell 7.
 

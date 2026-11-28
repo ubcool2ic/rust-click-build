@@ -91,19 +91,92 @@ function Set-RcbProcessArgument {
     taskkill /T /F on Windows PowerShell 5.1. Still tries to kill descendants
     after the parent has exited.
 #>
+function Get-RcbDirectChildIds {
+    param([int]$ParentId)
+    $ids = New-Object System.Collections.Generic.List[int]
+    if ($ParentId -le 0) { return @() }
+    if ($env:OS -eq 'Windows_NT') {
+        try {
+            $procs = Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$ParentId" -ErrorAction Stop
+            foreach ($pr in @($procs)) { [void]$ids.Add([int]$pr.ProcessId) }
+        } catch {
+            try {
+                $procs = Get-WmiObject Win32_Process -Filter "ParentProcessId=$ParentId" -ErrorAction SilentlyContinue
+                foreach ($pr in @($procs)) { [void]$ids.Add([int]$pr.ProcessId) }
+            } catch { $null = $_ }
+        }
+        return $ids.ToArray()
+    }
+    try {
+        $taskRoot = "/proc/$ParentId/task"
+        if ([System.IO.Directory]::Exists($taskRoot)) {
+            foreach ($taskDir in [System.IO.Directory]::GetDirectories($taskRoot)) {
+                $cf = [System.IO.Path]::Combine($taskDir, 'children')
+                if ([System.IO.File]::Exists($cf)) {
+                    $txt = [System.IO.File]::ReadAllText($cf)
+                    foreach ($tok in ($txt -split '\s+')) {
+                        $n = 0
+                        if ([int]::TryParse($tok, [ref]$n) -and $n -gt 0) { [void]$ids.Add($n) }
+                    }
+                }
+            }
+        }
+    } catch { $null = $_ }
+    return $ids.ToArray()
+}
+
+function Add-RcbDescendantIds {
+    param([int]$RootId, [System.Collections.Generic.HashSet[int]]$Into, [int]$Depth = 0)
+    if ($null -eq $Into -or $RootId -le 0 -or $Depth -gt 32) { return }
+    foreach ($cid in @(Get-RcbDirectChildIds -ParentId $RootId)) {
+        if ($Into.Add($cid)) {
+            Add-RcbDescendantIds -RootId $cid -Into $Into -Depth ($Depth + 1)
+        }
+    }
+}
+
+function Stop-RcbProcessIds {
+    param([int[]]$Ids)
+    foreach ($id in @($Ids)) {
+        if ($id -le 0) { continue }
+        try {
+            $pr = [System.Diagnostics.Process]::GetProcessById($id)
+        } catch { continue }
+        try {
+            if ($PSVersionTable.PSVersion.Major -ge 6) {
+                try { $pr.Kill($true) } catch { try { $pr.Kill() } catch { $null = $_ } }
+            } else {
+                try { $pr.Kill() } catch { $null = $_ }
+            }
+        } catch { $null = $_ }
+        try { $pr.Dispose() } catch { $null = $_ }
+    }
+}
+
 function Stop-ProcessTree {
-    param([System.Diagnostics.Process]$Process)
-    if ($null -eq $Process) { return }
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int[]]$KnownIds = @()
+    )
+    if ($null -eq $Process -and (@($KnownIds).Count -eq 0)) { return }
     $procId = 0
-    try { $procId = $Process.Id } catch { $procId = 0 }
-    $alreadyExited = $false
-    try { $alreadyExited = $Process.HasExited } catch { $alreadyExited = $true }
+    $alreadyExited = $true
+    if ($null -ne $Process) {
+        try { $procId = $Process.Id } catch { $procId = 0 }
+        try { $alreadyExited = $Process.HasExited } catch { $alreadyExited = $true }
+    }
+    $desc = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($k in @($KnownIds)) { if ($k -gt 0) { [void]$desc.Add($k) } }
+    if ($procId -gt 0) { Add-RcbDescendantIds -RootId $procId -Into $desc }
     if ($PSVersionTable.PSVersion.Major -ge 6) {
-        if (-not $alreadyExited) {
+        if ($null -ne $Process -and -not $alreadyExited) {
             try { $Process.Kill($true) } catch {
                 try { $Process.Kill() } catch { $null = $_ }
             }
         }
+        # Kill leftover descendants even when the parent has already exited
+        # (on Unix they are reparented and Kill($true) on a dead parent is a no-op).
+        Stop-RcbProcessIds -Ids @($desc)
         return
     }
     $isWin = ($env:OS -eq 'Windows_NT')
@@ -129,11 +202,26 @@ function Stop-ProcessTree {
     } elseif (-not $alreadyExited) {
         try { $Process.Kill() } catch { $null = $_ }
     }
+    Stop-RcbProcessIds -Ids @($desc)
 }
 
 function Stop-RcbProcessTree {
-    param([System.Diagnostics.Process]$Process)
-    Stop-ProcessTree -Process $Process
+    param([System.Diagnostics.Process]$Process, [int[]]$KnownIds = @())
+    Stop-ProcessTree -Process $Process -KnownIds $KnownIds
+}
+
+function Test-RcbRustupSignerSubject {
+    param([string]$Subject)
+    # Exact CN or O of the Rust Foundation, not a substring match on "Rust".
+    $allowed = @('Rust Foundation', 'The Rust Foundation')
+    foreach ($part in @(([string]$Subject) -split ',')) {
+        $p = $part.Trim()
+        if ($p -match '^(CN|O)\s*=\s*(.+)$') {
+            $name = $Matches[2].Trim().Trim('"')
+            if ($allowed -contains $name) { return $true }
+        }
+    }
+    return $false
 }
 
 <#
@@ -210,7 +298,8 @@ function Invoke-ToolProcess {
         [scriptblock]$OnOutputLine = $null,
         [scriptblock]$OnTick = $null,
         [int]$TimeoutSec = 0,
-        [hashtable]$ExtraEnvironment = $null
+        [hashtable]$ExtraEnvironment = $null,
+        [string[]]$RemoveEnvironment = @()
     )
 
     if ([string]::IsNullOrWhiteSpace($FilePath)) {
@@ -247,6 +336,11 @@ function Invoke-ToolProcess {
                 $psi.EnvironmentVariables[$k] = [string]$ExtraEnvironment[$k]
             }
         }
+        foreach ($k in @($RemoveEnvironment)) {
+            if (-not [string]::IsNullOrWhiteSpace($k)) {
+                try { $null = $psi.EnvironmentVariables.Remove($k) } catch { $null = $_ }
+            }
+        }
     } catch { $null = $_ }
 
     $process = $null
@@ -275,21 +369,24 @@ function Invoke-ToolProcess {
         $deadline = $null
         if ($TimeoutSec -gt 0) { $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec) }
         $exitedAt = $null
+        $knownDescendants = New-Object 'System.Collections.Generic.HashSet[int]'
+        try { Add-RcbDescendantIds -RootId $process.Id -Into $knownDescendants } catch { $null = $_ }
 
         while ($true) {
             if (Test-RcbCancelRequested) {
                 $cancelled = $true
-                Stop-ProcessTree -Process $process
+                Stop-ProcessTree -Process $process -KnownIds @($knownDescendants)
                 break
             }
             $hasExited = $false
             try { $hasExited = $process.HasExited } catch { $hasExited = $true }
             if ($hasExited -and $null -eq $exitedAt) { $exitedAt = [datetime]::UtcNow }
+            try { Add-RcbDescendantIds -RootId $process.Id -Into $knownDescendants } catch { $null = $_ }
             # A successful (or already-finished) exit must not be reported as TimedOut,
             # even if a grandchild is still holding the pipes when the deadline hits.
             if ($null -ne $deadline -and [datetime]::UtcNow -gt $deadline -and -not $hasExited) {
                 $timedOut = $true
-                Stop-ProcessTree -Process $process
+                Stop-ProcessTree -Process $process -KnownIds @($knownDescendants)
                 break
             }
             if ($hasExited -and (([datetime]::UtcNow - $exitedAt).TotalMilliseconds -ge 400)) {
@@ -319,7 +416,7 @@ function Invoke-ToolProcess {
                         try { & $OnOutputLine $line } catch {
                             $callbackError = $_
                             $cancelled = $true
-                            Stop-ProcessTree -Process $process
+                            Stop-ProcessTree -Process $process -KnownIds @($knownDescendants)
                             break
                         }
                     }
@@ -336,7 +433,7 @@ function Invoke-ToolProcess {
                         try { & $OnOutputLine $line } catch {
                             $callbackError = $_
                             $cancelled = $true
-                            Stop-ProcessTree -Process $process
+                            Stop-ProcessTree -Process $process -KnownIds @($knownDescendants)
                             break
                         }
                     }
@@ -346,9 +443,9 @@ function Invoke-ToolProcess {
         }
 
         if (-not $process.HasExited) { $null = $process.WaitForExit(2000) }
-        if (-not $process.HasExited) { Stop-ProcessTree -Process $process; $null = $process.WaitForExit(2000) }
+        if (-not $process.HasExited) { Stop-ProcessTree -Process $process -KnownIds @($knownDescendants); $null = $process.WaitForExit(2000) }
         # Reap any leftover children holding the pipes.
-        try { Stop-ProcessTree -Process $process } catch { $null = $_ }
+        try { Stop-ProcessTree -Process $process -KnownIds @($knownDescendants) } catch { $null = $_ }
         $exit = -1
         try { if ($process.HasExited) { $exit = $process.ExitCode } } catch { $exit = -1 }
         if ($timedOut -or $cancelled) { $exit = -1 }
