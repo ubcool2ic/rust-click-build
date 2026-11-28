@@ -1,0 +1,9 @@
+/gui/target/
+/_built/
+*.exe
+.DS_Store
+
+# Signing defaults and certificates (never commit secrets)
+rcb.sign.json
+*.pfx
+*.p12
