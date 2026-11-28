@@ -104,6 +104,14 @@ Describe 'Get-RcbSignSettings' {
         Set-Content -LiteralPath $bad -Value '{not json'
         { Get-RcbSignSettings -SignFlag $true -SignConfigPath $bad } | Should -Throw -ExceptionType ([System.Exception])
     }
+
+    It 'keeps the DigiCert default on HTTP because that TSA does not serve HTTPS' {
+        $s = Get-RcbSignSettings -SignFlag $true
+        $s.TimestampUrl | Should -Be 'http://timestamp.digicert.com'
+        $s.TimestampHttpWarning | Should -BeTrue
+        $script:RcbDefaultTimestampUrl | Should -Be 'http://timestamp.digicert.com'
+        $script:RcbDefaultTimestampUrl | Should -Not -Match '^https://'
+    }
 }
 
 Describe 'Get-RcbRedactedSignArgs' {
@@ -300,7 +308,66 @@ Describe 'Invoke-RcbSignOneFile with a mocked signtool' {
     }
 }
 
+Describe 'secure pass file, leftover cleanup, and PFX add rollback' {
+    It 'creates the pass file at mode 0600 before writing, with no 0644 window' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
+        $src = Get-Content -Raw -LiteralPath (Join-Path $script:Root (Join-Path 'lib' 'RcbSign.ps1'))
+        $src | Should -Match 'UnixCreateMode'
+        $src | Should -Not -Match 'WriteAllText\(\$passFile'
+        $path = New-RcbSecurePassFile -Contents 'super-secret-pass'
+        try {
+            Test-Path -LiteralPath $path | Should -BeTrue
+            $mode = & /usr/bin/stat -c '%a' $path
+            $mode | Should -Be '600'
+            (Get-Content -Raw -LiteralPath $path) | Should -Be 'super-secret-pass'
+        } finally {
+            if (Test-Path -LiteralPath $path) {
+                [System.IO.File]::WriteAllBytes($path, [byte[]]@())
+                Remove-Item -LiteralPath $path -Force
+            }
+        }
+    }
+
+    It 'removes stale rcb-sign-*.pass leftovers and leaves other temp files alone' {
+        $dir = [System.IO.Path]::GetTempPath()
+        $stale = Join-Path $dir ('rcb-sign-' + [guid]::NewGuid().ToString('N') + '.pass')
+        $other = Join-Path $dir ('rcb-other-' + [guid]::NewGuid().ToString('N') + '.txt')
+        [System.IO.File]::WriteAllText($stale, 'leftover-secret')
+        [System.IO.File]::WriteAllText($other, 'keep-me')
+        try {
+            Clear-RcbSignLeftovers
+            Test-Path -LiteralPath $stale | Should -BeFalse
+            Test-Path -LiteralPath $other | Should -BeTrue
+            (Get-Content -Raw -LiteralPath $other) | Should -Match 'keep-me'
+        } finally {
+            if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
+            if (Test-Path -LiteralPath $other) { Remove-Item -LiteralPath $other -Force }
+        }
+    }
+
+    It 'undoes a successful store Add if a later line throws' {
+        $store = New-Object PSObject
+        $store | Add-Member NoteProperty Added 0
+        $store | Add-Member NoteProperty Removed 0
+        $store | Add-Member ScriptMethod Add { param($c) $this.Added++ }
+        $store | Add-Member ScriptMethod Remove { param($c) $this.Removed++ }
+        $cert = New-Object PSObject
+        $cert | Add-Member NoteProperty FriendlyName '' -Force
+        $script:RcbPfxAfterAddHook = { throw 'after add' }
+        try {
+            { Invoke-RcbPfxStoreAdd -Store $store -Cert $cert } | Should -Throw 'after add'
+        } finally {
+            if ($store.Added -gt $store.Removed) { Undo-RcbPfxStoreAdd -Store $store -Cert $cert }
+            $script:RcbPfxAfterAddHook = $null
+        }
+        $store.Added | Should -Be 1
+        $store.Removed | Should -Be 1
+        $cert.FriendlyName | Should -Be 'rcb-temp-sign'
+        (Get-RcbTempPfxFriendlyName) | Should -Be 'rcb-temp-sign'
+    }
+}
+
 Describe 'a requested sign that fails fails the run' {
+
     It 'records SIGN FAILED and returns Success false (exit 1) when signing fails' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
         $dir = Join-Path $TestDrive 'sign-pass-build'
         New-Item -ItemType Directory -Path (Join-Path $dir 'src') | Out-Null
@@ -334,6 +401,48 @@ Describe 'a requested sign that fails fails the run' {
             $res.Results[0].BuildStatus | Should -Be 'PASS'
             $res.Results[0].Sign | Should -Be 'SIGN FAILED'
             Test-Path -LiteralPath (Join-Path $dir '_built/sign-pass-build/signme.exe') | Should -BeTrue
+        } finally {
+            $env:PATH = $saved
+            if ($null -eq $prevTool) { Remove-Item Env:\RCB_SIGNTOOL -ErrorAction SilentlyContinue } else { $env:RCB_SIGNTOOL = $prevTool }
+        }
+    }
+
+    It 'fails the run with a clear message when -Sign is on and no artifacts were collected' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
+        $dir = Join-Path $TestDrive 'sign-zero-artifacts'
+        New-Item -ItemType Directory -Path (Join-Path $dir 'src') | Out-Null
+        Set-Content -LiteralPath (Join-Path $dir 'Cargo.toml') -Value "[package]`nname = `"signlib`"`nversion = `"0.1.0`"`nedition = `"2021`"`n"
+        Set-Content -LiteralPath (Join-Path $dir 'src/lib.rs') -Value ''
+
+        $shim = Join-Path $TestDrive 'sign-zero-shim'
+        New-Item -ItemType Directory -Path $shim | Out-Null
+        $cargo = Join-Path $shim 'cargo'
+        $metaJson = @{
+            packages = @(@{ name = 'signlib'; targets = @(@{ name = 'signlib'; kind = @('lib') }) })
+            target_directory = (Join-Path $dir 'target')
+            version = 1
+        } | ConvertTo-Json -Compress -Depth 6
+        $metaFile = Join-Path $shim 'meta.json'
+        [System.IO.File]::WriteAllText($metaFile, $metaJson)
+        $bash = "#!/usr/bin/env bash`ncase `"`$1`" in`n  metadata) cat '$metaFile'; exit 0 ;;`n  build) echo Finished; exit 0 ;;`n  *) exit 0 ;;`nesac`n"
+        [System.IO.File]::WriteAllText($cargo, $bash)
+        & /bin/chmod +x $cargo
+
+        $fakeDir = Join-Path $TestDrive 'sign-zero-tool'
+        $fake = New-FakeSignTool -Dir $fakeDir
+
+        $saved = $env:PATH
+        $prevTool = $env:RCB_SIGNTOOL
+        $env:PATH = $shim + [System.IO.Path]::PathSeparator + $env:PATH
+        $env:RCB_SIGNTOOL = $fake.Path
+        try {
+            $res = Start-BuildPipeline -TargetFolder $dir -ActiveProfile 'release' -RunTests $false -NoInstallFlag $true -NoOpenFlag $true -NoRtkUpdateFlag $true -SignFlag $true -CertThumbprint 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+            $res.Success | Should -BeFalse
+            $res.Results[0].BuildStatus | Should -Be 'PASS'
+            $res.Results[0].Artifacts | Should -Be 0
+            $res.Results[0].Sign | Should -Be 'SIGN FAILED'
+            $log = Get-ChildItem -LiteralPath (Join-Path $dir '_built') -Filter 'build-*.log' | Select-Object -First 1
+            $log | Should -Not -BeNullOrEmpty
+            (Get-Content -Raw -LiteralPath $log.FullName) | Should -Match 'no \.exe/\.dll artifacts were collected to sign'
         } finally {
             $env:PATH = $saved
             if ($null -eq $prevTool) { Remove-Item Env:\RCB_SIGNTOOL -ErrorAction SilentlyContinue } else { $env:RCB_SIGNTOOL = $prevTool }

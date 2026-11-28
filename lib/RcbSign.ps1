@@ -6,7 +6,11 @@
 # osslsigncode the password is written to a 0600 temp file passed as -readpass
 # and that file is deleted in finally.
 
+# DigiCert's RFC 3161 TSA is HTTP-only (port 80). https://timestamp.digicert.com
+# does not serve the protocol (connection refused / timed out); DigiCert's
+# documented URL is http://timestamp.digicert.com. A non-HTTPS URL still warns.
 $script:RcbDefaultTimestampUrl = 'http://timestamp.digicert.com'
+$script:RcbTempPfxFriendlyName = 'rcb-temp-sign'
 $script:RcbSignConfigName = 'rcb.sign.json'
 
 function Get-RcbRedactedSignArgs {
@@ -119,6 +123,99 @@ function Test-RcbCertThumbprint {
     return (-not [string]::IsNullOrWhiteSpace($n))
 }
 
+function Get-RcbTempPfxFriendlyName { return [string]$script:RcbTempPfxFriendlyName }
+
+<#
+.SYNOPSIS
+    Adds a certificate to a store, tags it rcb-temp-sign, and runs an optional
+    after-add hook so a later throw can be undone by Undo-RcbPfxStoreAdd.
+#>
+function Invoke-RcbPfxStoreAdd {
+    param($Store, $Cert)
+    if ($null -eq $Store -or $null -eq $Cert) { throw 'Invoke-RcbPfxStoreAdd requires a store and a certificate' }
+    try { $Cert.FriendlyName = (Get-RcbTempPfxFriendlyName) } catch { $null = $_ }
+    $Store.Add($Cert)
+    if ($null -ne $script:RcbPfxAfterAddHook) { & $script:RcbPfxAfterAddHook $Store $Cert }
+}
+
+function Undo-RcbPfxStoreAdd {
+    param($Store, $Cert)
+    if ($null -eq $Store -or $null -eq $Cert) { return }
+    try { $Store.Remove($Cert) } catch { $null = $_ }
+}
+
+<#
+.SYNOPSIS
+    Removes leftover rcb-sign-*.pass files from the temp directory and, on
+    Windows, any CurrentUser\My certificates tagged FriendlyName rcb-temp-sign.
+#>
+function Clear-RcbSignLeftovers {
+    $dir = [System.IO.Path]::GetTempPath()
+    try {
+        foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter 'rcb-sign-*.pass' -File -ErrorAction SilentlyContinue)) {
+            try { [System.IO.File]::WriteAllBytes($f.FullName, [byte[]]@()) } catch { $null = $_ }
+            try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue } catch { $null = $_ }
+        }
+    } catch { $null = $_ }
+    $isWin = ($script:IsWindowsOS -or $env:OS -eq 'Windows_NT')
+    if (-not $isWin) { return }
+    $store = $null
+    try {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('My', 'CurrentUser')
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $name = Get-RcbTempPfxFriendlyName
+        $toRemove = @($store.Certificates | Where-Object { [string]$_.FriendlyName -eq $name })
+        foreach ($c in $toRemove) {
+            try { $store.Remove($c) } catch { $null = $_ }
+            try { $c.Dispose() } catch { $null = $_ }
+        }
+    } catch { $null = $_ }
+    finally {
+        if ($null -ne $store) { try { $store.Close() } catch { $null = $_ } }
+    }
+}
+
+<#
+.SYNOPSIS
+    Creates a temp rcb-sign-*.pass file with mode 0600 (UnixCreateMode) before
+    any bytes are written, so there is no 0644 window.
+#>
+function New-RcbSecurePassFile {
+    param([string]$Contents)
+    $dir = [System.IO.Path]::GetTempPath()
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $bytes = $utf8NoBom.GetBytes([string]$Contents)
+    $isWin = ($script:IsWindowsOS -or $env:OS -eq 'Windows_NT')
+    $last = $null
+    for ($i = 0; $i -lt 8; $i++) {
+        $path = [System.IO.Path]::Combine($dir, ('rcb-sign-' + [guid]::NewGuid().ToString('N') + '.pass'))
+        $fs = $null
+        try {
+            $opts = New-Object System.IO.FileStreamOptions
+            $opts.Mode = [System.IO.FileMode]::CreateNew
+            $opts.Access = [System.IO.FileAccess]::Write
+            $opts.Share = [System.IO.FileShare]::None
+            if (-not $isWin) {
+                $opts.UnixCreateMode = [System.IO.UnixFileMode]::UserRead -bor [System.IO.UnixFileMode]::UserWrite
+            }
+            $fs = [System.IO.FileStream]::new($path, $opts)
+            if ($bytes.Length -gt 0) { $fs.Write($bytes, 0, $bytes.Length) }
+            $fs.Flush()
+            return $path
+        } catch {
+            $last = $_
+            if (-not [string]::IsNullOrEmpty($path) -and (Test-Path -LiteralPath $path)) {
+                try { [System.IO.File]::WriteAllBytes($path, [byte[]]@()) } catch { $null = $_ }
+                try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch { $null = $_ }
+            }
+        } finally {
+            if ($null -ne $fs) { try { $fs.Dispose() } catch { $null = $_ } }
+        }
+    }
+    $msg = if ($null -ne $last) { $last.Exception.Message } else { 'could not create a 0600 pass file' }
+    throw $msg
+}
+
 function Import-RcbPfxCertificate {
     param([string]$PfxPath, [string]$Password)
     $result = [PSCustomObject]@{
@@ -136,6 +233,9 @@ function Import-RcbPfxCertificate {
         $result.Error = 'PFX signing with signtool requires Windows so the certificate can be imported into CurrentUser\My and used with /sha1 (the password is never passed on the command line).'
         return $result
     }
+    $store = $null
+    $cert = $null
+    $added = $false
     try {
         $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet
         try {
@@ -151,7 +251,8 @@ function Import-RcbPfxCertificate {
         $existing = $store.Certificates.Find([System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $thumb, $false)
         $temporary = $false
         if ($existing.Count -eq 0) {
-            $store.Add($cert)
+            Invoke-RcbPfxStoreAdd -Store $store -Cert $cert
+            $added = $true
             $temporary = $true
         }
         $result.Thumbprint = $thumb
@@ -160,9 +261,18 @@ function Import-RcbPfxCertificate {
         $result.Certificate = $cert
         return $result
     } catch {
+        if ($added) {
+            Undo-RcbPfxStoreAdd -Store $store -Cert $cert
+            $added = $false
+        }
+        if ($null -ne $store) { try { $store.Close() } catch { $null = $_ }; $store = $null }
+        if ($null -ne $cert) { try { $cert.Dispose() } catch { $null = $_ }; $cert = $null }
         $msg = $_.Exception.Message
         if (-not [string]::IsNullOrEmpty($Password)) { $msg = $msg.Replace($Password, '<redacted>') }
         $result.Error = $msg
+        $result.Store = $null
+        $result.Certificate = $null
+        $result.Temporary = $false
         return $result
     }
 }
@@ -280,14 +390,7 @@ function Invoke-RcbSignOneFile {
             $outFile = $FilePath + '.signed-tmp'
             $args.Add('sign')
             if ($hasPfx) {
-                $passFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ('rcb-sign-' + [guid]::NewGuid().ToString('N') + '.pass'))
-                $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-                [System.IO.File]::WriteAllText($passFile, $pfxPass, $utf8NoBom)
-                try {
-                    if (-not ($script:IsWindowsOS -or $env:OS -eq 'Windows_NT')) {
-                        & /bin/chmod 600 $passFile
-                    }
-                } catch { $null = $_ }
+                $passFile = New-RcbSecurePassFile -Contents $pfxPass
                 $args.Add('-pkcs12'); $args.Add($Settings.PfxPath)
                 $args.Add('-readpass'); $args.Add($passFile)
             } else {
@@ -381,6 +484,7 @@ function Invoke-RcbSignBuiltFolder {
     )
     $results = New-Object System.Collections.Generic.List[object]
     if ($null -eq $Settings -or -not $Settings.Enabled) { return @() }
+    Clear-RcbSignLeftovers
     if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return @() }
     $files = @()
     try {

@@ -135,21 +135,126 @@ function Add-RcbDescendantIds {
     }
 }
 
+function Initialize-RcbLibc {
+    if ($env:OS -eq 'Windows_NT') { return }
+    if ('RcbLibc' -as [type]) { return }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class RcbLibc {
+    public const int PR_SET_CHILD_SUBREAPER = 36;
+    public const int WNOHANG = 1;
+    [DllImport("libc", SetLastError = true)]
+    public static extern int prctl(int option, ulong arg2, ulong arg3, ulong arg4, ulong arg5);
+    [DllImport("libc", SetLastError = true)]
+    public static extern int waitpid(int pid, out int status, int options);
+}
+"@
+}
+
+function Initialize-RcbChildSubreaper {
+    if ($env:OS -eq 'Windows_NT') { return }
+    if ($script:RcbSubreaperReady -eq $true) { return }
+    try {
+        Initialize-RcbLibc
+        $rc = [RcbLibc]::prctl(36, [uint64]1, [uint64]0, [uint64]0, [uint64]0)
+        $script:RcbSubreaperReady = ($rc -eq 0)
+    } catch {
+        $script:RcbSubreaperReady = $false
+    }
+}
+
+function Test-RcbPidZombie {
+    param([int]$Id)
+    if ($Id -le 0 -or $env:OS -eq 'Windows_NT') { return $false }
+    $statPath = "/proc/$Id/stat"
+    if (-not [System.IO.File]::Exists($statPath)) { return $false }
+    try {
+        $txt = [System.IO.File]::ReadAllText($statPath)
+        return ($txt -match '\)\s+Z\s')
+    } catch { return $false }
+}
+
+function Wait-RcbPid {
+    param([int]$Id)
+    if ($Id -le 0) { return }
+    if ($env:OS -eq 'Windows_NT') {
+        try {
+            $pr = [System.Diagnostics.Process]::GetProcessById($Id)
+            $null = $pr.WaitForExit(500)
+        } catch { $null = $_ }
+        return
+    }
+    try {
+        Initialize-RcbLibc
+        $status = 0
+        if (Test-RcbPidZombie -Id $Id) {
+            [void][RcbLibc]::waitpid($Id, [ref]$status, 0)
+        } else {
+            [void][RcbLibc]::waitpid($Id, [ref]$status, [RcbLibc]::WNOHANG)
+        }
+    } catch { $null = $_ }
+}
+
+function Add-RcbReparentedStragglers {
+    param(
+        [int]$SelfId,
+        [System.Collections.Generic.HashSet[int]]$Before,
+        [int]$StartedId,
+        [System.Collections.Generic.HashSet[int]]$Into
+    )
+    if ($null -eq $Into -or $SelfId -le 0) { return }
+    foreach ($cid in @(Get-RcbDirectChildIds -ParentId $SelfId)) {
+        if ($cid -le 0 -or $cid -eq $StartedId) { continue }
+        if ($null -ne $Before -and $Before.Contains($cid)) { continue }
+        if ($Into.Add($cid)) { Add-RcbDescendantIds -RootId $cid -Into $Into }
+    }
+}
+
+function Test-RcbPidAlive {
+    param([int]$Id)
+    if ($Id -le 0) { return $false }
+    if ($env:OS -eq 'Windows_NT') {
+        try {
+            $pr = [System.Diagnostics.Process]::GetProcessById($Id)
+            return -not $pr.HasExited
+        } catch { return $false }
+    }
+    if (-not [System.IO.Directory]::Exists("/proc/$Id")) { return $false }
+    # A reparented child we killed can sit as our zombie until waitpid.
+    if (Test-RcbPidZombie -Id $Id) { return $false }
+    return $true
+}
+
+function Sync-RcbKnownDescendants {
+    param([System.Diagnostics.Process]$Process, [System.Collections.Generic.HashSet[int]]$Into)
+    if ($null -eq $Into) { return }
+    $id = 0
+    try { if ($null -ne $Process) { $id = $Process.Id } } catch { $id = 0 }
+    if ($id -gt 0) { Add-RcbDescendantIds -RootId $id -Into $Into }
+}
+
 function Stop-RcbProcessIds {
     param([int[]]$Ids)
     foreach ($id in @($Ids)) {
         if ($id -le 0) { continue }
         try {
             $pr = [System.Diagnostics.Process]::GetProcessById($id)
-        } catch { continue }
-        try {
-            if ($PSVersionTable.PSVersion.Major -ge 6) {
-                try { $pr.Kill($true) } catch { try { $pr.Kill() } catch { $null = $_ } }
-            } else {
-                try { $pr.Kill() } catch { $null = $_ }
-            }
-        } catch { $null = $_ }
-        try { $pr.Dispose() } catch { $null = $_ }
+        } catch { $pr = $null }
+        if ($null -ne $pr) {
+            try {
+                if (-not $pr.HasExited) {
+                    if ($PSVersionTable.PSVersion.Major -ge 6) {
+                        try { $pr.Kill($true) } catch { try { $pr.Kill() } catch { $null = $_ } }
+                    } else {
+                        try { $pr.Kill() } catch { $null = $_ }
+                    }
+                }
+            } catch { $null = $_ }
+            try { $pr.Dispose() } catch { $null = $_ }
+        }
+        # Reap so a subreaper-owned zombie does not linger in /proc.
+        Wait-RcbPid -Id $id
     }
 }
 
@@ -353,6 +458,14 @@ function Invoke-ToolProcess {
     try {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $psi
+        Initialize-RcbChildSubreaper
+        $selfPid = [int]$PID
+        $childrenBefore = New-Object 'System.Collections.Generic.HashSet[int]'
+        try {
+            foreach ($cid in @(Get-RcbDirectChildIds -ParentId $selfPid)) {
+                if ($cid -gt 0) { [void]$childrenBefore.Add($cid) }
+            }
+        } catch { $null = $_ }
         try {
             $null = $process.Start()
         } catch {
@@ -362,6 +475,19 @@ function Invoke-ToolProcess {
                 TimedOut = $false; Cancelled = $false
             }
         }
+        $knownDescendants = New-Object 'System.Collections.Generic.HashSet[int]'
+        # Snapshot immediately, before anything that might reap the child, and
+        # tight-spin briefly so a parent that forks and exits at once is still
+        # observed while /proc/<pid>/children is populated.
+        try {
+            $spinEnd = [datetime]::UtcNow.AddMilliseconds(50)
+            do {
+                Sync-RcbKnownDescendants -Process $process -Into $knownDescendants
+                Add-RcbReparentedStragglers -SelfId $selfPid -Before $childrenBefore -StartedId $process.Id -Into $knownDescendants
+                if (-not (Test-RcbPidAlive -Id $process.Id)) { break }
+            } while ([datetime]::UtcNow -lt $spinEnd)
+        } catch { $null = $_ }
+
         try { $process.StandardInput.Close() } catch { $null = $_ }
 
         $outTask = $process.StandardOutput.ReadLineAsync()
@@ -369,8 +495,6 @@ function Invoke-ToolProcess {
         $deadline = $null
         if ($TimeoutSec -gt 0) { $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec) }
         $exitedAt = $null
-        $knownDescendants = New-Object 'System.Collections.Generic.HashSet[int]'
-        try { Add-RcbDescendantIds -RootId $process.Id -Into $knownDescendants } catch { $null = $_ }
 
         while ($true) {
             if (Test-RcbCancelRequested) {
@@ -378,10 +502,17 @@ function Invoke-ToolProcess {
                 Stop-ProcessTree -Process $process -KnownIds @($knownDescendants)
                 break
             }
+            # Snapshot before HasExited: HasExited may reap, after which
+            # Linux has already reparented children to init.
+            try { Sync-RcbKnownDescendants -Process $process -Into $knownDescendants } catch { $null = $_ }
             $hasExited = $false
             try { $hasExited = $process.HasExited } catch { $hasExited = $true }
-            if ($hasExited -and $null -eq $exitedAt) { $exitedAt = [datetime]::UtcNow }
-            try { Add-RcbDescendantIds -RootId $process.Id -Into $knownDescendants } catch { $null = $_ }
+            if ($hasExited -and $null -eq $exitedAt) {
+                # Re-snapshot after the parent exits and collect reparented stragglers.
+                try { Sync-RcbKnownDescendants -Process $process -Into $knownDescendants } catch { $null = $_ }
+                try { Add-RcbReparentedStragglers -SelfId $selfPid -Before $childrenBefore -StartedId $process.Id -Into $knownDescendants } catch { $null = $_ }
+                $exitedAt = [datetime]::UtcNow
+            }
             # A successful (or already-finished) exit must not be reported as TimedOut,
             # even if a grandchild is still holding the pipes when the deadline hits.
             if ($null -ne $deadline -and [datetime]::UtcNow -gt $deadline -and -not $hasExited) {
@@ -442,9 +573,13 @@ function Invoke-ToolProcess {
             }
         }
 
+        # Re-snapshot after the parent exits and kill reparented stragglers.
+        try { Sync-RcbKnownDescendants -Process $process -Into $knownDescendants } catch { $null = $_ }
+        try { Add-RcbReparentedStragglers -SelfId $selfPid -Before $childrenBefore -StartedId $process.Id -Into $knownDescendants } catch { $null = $_ }
         if (-not $process.HasExited) { $null = $process.WaitForExit(2000) }
+        try { Sync-RcbKnownDescendants -Process $process -Into $knownDescendants } catch { $null = $_ }
         if (-not $process.HasExited) { Stop-ProcessTree -Process $process -KnownIds @($knownDescendants); $null = $process.WaitForExit(2000) }
-        # Reap any leftover children holding the pipes.
+        try { Sync-RcbKnownDescendants -Process $process -Into $knownDescendants } catch { $null = $_ }
         try { Stop-ProcessTree -Process $process -KnownIds @($knownDescendants) } catch { $null = $_ }
         $exit = -1
         try { if ($process.HasExited) { $exit = $process.ExitCode } } catch { $exit = -1 }

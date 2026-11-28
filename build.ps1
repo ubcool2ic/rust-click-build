@@ -651,6 +651,7 @@ function Start-BuildPipeline {
             if ($signSettings.TimestampHttpWarning) {
                 Write-BuildLog "sign: timestamp URL is not HTTPS ($($signSettings.TimestampUrl)). RFC 3161 tokens are still signed, so HTTP is allowed; prefer https:// if the TSA offers it." -Role warning -UiCallback $UiLog
             }
+            Clear-RcbSignLeftovers
         }
         Write-RcbEvent 'start' ([ordered]@{ version = 1; path = $resolvedPath; profile = $ActiveProfile; test = $RunTests; rtk_update = (-not $NoRtkUpdateFlag); sign = [bool]$signSettings.Enabled; log_file = $script:LogFilePath })
 
@@ -930,7 +931,12 @@ function Start-BuildPipeline {
                         })
                     })
                     $signStatus = Get-RcbSignSummary -Results $signResults
-                    if ($signResults.Count -eq 0) { $signStatus = 'skipped' }
+                    if ($signResults.Count -eq 0) {
+                        $signStatus = 'SIGN FAILED'
+                        $why = '-Sign was set but no .exe/.dll artifacts were collected to sign.'
+                        Write-BuildLog "  sign: $why" -Role danger -UiCallback $UiLog
+                        Write-RcbEvent 'sign' ([ordered]@{ index = $projIndex; name = $projName; file = ''; status = 'SIGN FAILED'; error = $why })
+                    }
                 }
                 if ($signStatus -eq 'SIGN FAILED') { $overallSuccess = $false }
             }

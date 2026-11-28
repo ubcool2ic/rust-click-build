@@ -21,7 +21,40 @@ Describe 'M1 Build.bat path quoting' {
         $bat | Should -Match '%A1:~0,1%'
         $bat | Should -Match '-Path "%~1"'
         $bat | Should -Not -Match '%2 %3 %4 %5 %6 %7 %8 %9'
-        $bat | Should -Match '"%~2"'
+        $cmds = @($bat -split "`r?`n" | Where-Object { $_ -notmatch '^\s*rem(\s|$)' }) -join "`n"
+        $cmds | Should -Not -Match 'set "MORE=%MORE%'
+        $bat | Should -Match 'call :append "%~2"'
+        $bat | Should -Match 'EnableDelayedExpansion'
+        $bat | Should -Match 'set MORE=!MORE! %1'
+        $bat | Should -Match 'endlocal & set MORE=%MORE%'
+    }
+
+    It 'simulates cmd set-quoted parsing: the old MORE idiom ends the assignment early' {
+        # cmd set "VAR=value": the next unescaped quote ends the assignment.
+        # After % expansion, set "MORE=%MORE% "%~2"" with MORE empty and %~2=foo
+        # becomes set "MORE= "foo"" — MORE is a single space, "foo"" is leftover.
+        $expanded = 'set "MORE= "foo""'
+        # cmd ends the quoted assignment at the first closing quote, not the last.
+        if ($expanded -notmatch '^\s*set\s+"([^"]*)"(.*)$') { throw 'simulator failed to parse' }
+        $Matches[1] | Should -Be 'MORE= '
+        $Matches[2] | Should -Match 'foo'
+    }
+
+    It 'simulates call :append with delayed expansion for spaces, parentheses, and ampersands' {
+        # :append does: set MORE=!MORE! %1   then  endlocal & set MORE=%MORE%
+        # call :append "%~2" passes a quoted argument, so %1 is "value".
+        $more = ''
+        foreach ($arg in @('-Test', 'foo bar', 'foo)bar', 'a&b')) {
+            $quoted = '"' + $arg + '"'
+            $more = $more + ' ' + $quoted
+        }
+        $more | Should -Be ' "-Test" "foo bar" "foo)bar" "a&b"'
+        $more | Should -Match '"foo bar"'
+        $more | Should -Match '"foo\)bar"'
+        $more | Should -Match '"a&b"'
+        # The final powershell line is: -Path "%~1"!MORE!
+        $line = 'powershell.exe -File build.ps1 -Path "C:\proj"' + $more
+        $line | Should -Match '-Path "C:\\proj" "-Test" "foo bar" "foo\)bar" "a&b"'
     }
 }
 
@@ -93,12 +126,17 @@ Describe 'S1 grandchild holding pipes does not hang or false-timeout' {
         Test-Path -LiteralPath $pidfile | Should -BeTrue
         $gp = (Get-Content -LiteralPath $pidfile -Raw).Trim()
         $gp | Should -Match '^[0-9]+$'
-        $alive = $false
-        try {
-            $pr = [System.Diagnostics.Process]::GetProcessById([int]$gp)
-            $alive = -not $pr.HasExited
-        } catch { $alive = $false }
-        $alive | Should -BeFalse
+        Test-RcbPidAlive -Id ([int]$gp) | Should -BeFalse
+    }
+    It 'kills a grandchild even when the parent exits immediately' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
+        $pidfile = Join-Path $TestDrive 'grandchild-immediate.pid'
+        $r = Invoke-ToolProcess -FilePath '/bin/sh' -ArgumentList @('-c', "sleep 25 & echo `$`! > `"$pidfile`"; exit 0") -TimeoutSec 0
+        $r.ExitCode | Should -Be 0
+        $r.TimedOut | Should -BeFalse
+        Test-Path -LiteralPath $pidfile | Should -BeTrue
+        $gp = (Get-Content -LiteralPath $pidfile -Raw).Trim()
+        $gp | Should -Match '^[0-9]+$'
+        Test-RcbPidAlive -Id ([int]$gp) | Should -BeFalse
     }
     It 'times out a still-running child and kills the tree, without marking a successful exit TimedOut' -Skip:($IsWindows -or $env:OS -eq 'Windows_NT') {
         $sw = [Diagnostics.Stopwatch]::StartNew()
