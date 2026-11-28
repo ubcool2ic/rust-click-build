@@ -4,6 +4,28 @@
 
 $script:BuildCancelRequested = $false
 $script:ResolvedCargoPath = $null
+$script:RcbOnTick = $null
+$script:RcbCancelBox = $null
+$script:RcbDiscoverySkipped = New-Object System.Collections.Generic.List[string]
+$script:RcbToolTimeoutSec = 7200
+if ($env:RCB_TOOL_TIMEOUT_SEC -match '^-?\d+$') {
+    $script:RcbToolTimeoutSec = [int]$env:RCB_TOOL_TIMEOUT_SEC
+}
+if ($null -eq $script:IsWindowsOS) {
+    $script:IsWindowsOS = ($env:OS -eq 'Windows_NT')
+    if ($PSVersionTable.PSVersion.Major -ge 6 -and $PSVersionTable.Platform -eq 'Unix') {
+        $script:IsWindowsOS = $false
+    }
+}
+
+function Test-RcbCancelRequested {
+    if ($script:BuildCancelRequested) { return $true }
+    if ($null -ne $script:RcbCancelBox -and [bool]$script:RcbCancelBox['Value']) {
+        $script:BuildCancelRequested = $true
+        return $true
+    }
+    return $false
+}
 
 <#
 .SYNOPSIS
@@ -35,6 +57,12 @@ function ConvertTo-CommandLineArgument {
     return $sb.ToString()
 }
 
+# Name used by the PR #2 tests and helpers.
+function ConvertTo-RcbWindowsArgument {
+    param([AllowNull()][string]$Argument)
+    return (ConvertTo-CommandLineArgument $Argument)
+}
+
 <#
 .SYNOPSIS
     Joins arguments into one command line that Start-Process -ArgumentList (string) can use.
@@ -45,25 +73,42 @@ function Join-RcbCommandLine {
     return (($ArgumentList | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join ' ')
 }
 
+function Set-RcbProcessArgument {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.ProcessStartInfo]$StartInfo,
+        [string[]]$ArgumentList
+    )
+    if ($null -ne $StartInfo.PSObject.Properties['ArgumentList']) {
+        foreach ($a in @($ArgumentList)) { $StartInfo.ArgumentList.Add([string]$a) }
+    } else {
+        $StartInfo.Arguments = Join-RcbCommandLine $ArgumentList
+    }
+}
+
 <#
 .SYNOPSIS
     Kills a process and its children. Uses Kill($true) on .NET Core and
-    taskkill /T /F on Windows PowerShell 5.1.
+    taskkill /T /F on Windows PowerShell 5.1. Still tries to kill descendants
+    after the parent has exited.
 #>
 function Stop-ProcessTree {
     param([System.Diagnostics.Process]$Process)
     if ($null -eq $Process) { return }
-    try { if ($Process.HasExited) { return } } catch { return }
+    $procId = 0
+    try { $procId = $Process.Id } catch { $procId = 0 }
+    $alreadyExited = $false
+    try { $alreadyExited = $Process.HasExited } catch { $alreadyExited = $true }
     if ($PSVersionTable.PSVersion.Major -ge 6) {
-        try { $Process.Kill($true) } catch {
-            try { $Process.Kill() } catch { $null = $_ }
+        if (-not $alreadyExited) {
+            try { $Process.Kill($true) } catch {
+                try { $Process.Kill() } catch { $null = $_ }
+            }
         }
         return
     }
     $isWin = ($env:OS -eq 'Windows_NT')
-    if ($isWin) {
+    if ($isWin -and $procId -gt 0) {
         try {
-            $procId = $Process.Id
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = 'taskkill.exe'
             $psi.Arguments = "/T /F /PID $procId"
@@ -77,11 +122,18 @@ function Stop-ProcessTree {
                 $tk.Dispose()
             }
         } catch {
-            try { $Process.Kill() } catch { $null = $_ }
+            if (-not $alreadyExited) {
+                try { $Process.Kill() } catch { $null = $_ }
+            }
         }
-    } else {
+    } elseif (-not $alreadyExited) {
         try { $Process.Kill() } catch { $null = $_ }
     }
+}
+
+function Stop-RcbProcessTree {
+    param([System.Diagnostics.Process]$Process)
+    Stop-ProcessTree -Process $Process
 }
 
 <#
@@ -100,29 +152,55 @@ function Resolve-CommandPath {
 
 <#
 .SYNOPSIS
-    Prepends ~/.cargo/bin to PATH when cargo is not yet visible. Returns $true
-    if cargo can be resolved afterwards.
+    Prepends $CARGO_HOME/bin (or ~/.cargo/bin) to PATH when cargo is not yet
+    visible. Uses [IO.Path]::Combine so a missing drive does not throw.
+    Returns $true if cargo can be resolved afterwards.
 #>
 function Add-CargoBinToPath {
-    $userHome = $env:USERPROFILE
-    if ([string]::IsNullOrEmpty($userHome)) { $userHome = $env:HOME }
+    $sep = [string][System.IO.Path]::PathSeparator
+    $trimChars = [char[]]@('\', '/')
+    $dirs = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrEmpty($env:CARGO_HOME)) {
+        try { $dirs.Add([System.IO.Path]::Combine($env:CARGO_HOME, 'bin')) } catch { $null = $_ }
+    }
+    $userHome = $null
+    if ($script:IsWindowsOS) { $userHome = $env:USERPROFILE } else { $userHome = $env:HOME }
+    if ([string]::IsNullOrEmpty($userHome)) { $userHome = $HOME }
     if (-not [string]::IsNullOrEmpty($userHome)) {
-        $cargoBin = Join-Path $userHome (Join-Path '.cargo' 'bin')
-        if ((Test-Path -LiteralPath $cargoBin) -and ($null -eq (Get-Command cargo -ErrorAction SilentlyContinue))) {
-            $pathParts = $env:PATH -split [System.IO.Path]::PathSeparator
-            if (-not ($pathParts -contains $cargoBin)) {
-                $env:PATH = $cargoBin + [System.IO.Path]::PathSeparator + $env:PATH
+        try { $dirs.Add([System.IO.Path]::Combine($userHome, '.cargo', 'bin')) } catch { $null = $_ }
+    }
+
+    foreach ($dir in $dirs) {
+        if ($null -ne (Get-Command cargo -ErrorAction SilentlyContinue)) { break }
+        $exists = $false
+        try { $exists = [bool](Test-Path -LiteralPath $dir -PathType Container) } catch { $exists = $false }
+        if (-not $exists) { continue }
+        $want = $dir.TrimEnd($trimChars)
+        $comparison = [System.StringComparison]::Ordinal
+        if ($script:IsWindowsOS) { $comparison = [System.StringComparison]::OrdinalIgnoreCase }
+        $present = $false
+        foreach ($p in ([string]$env:PATH).Split([char[]]@([System.IO.Path]::PathSeparator))) {
+            if ([string]::IsNullOrEmpty($p)) { continue }
+            $have = $p.Trim().TrimEnd($trimChars)
+            if ([string]::Equals($have, $want, $comparison)) { $present = $true; break }
+        }
+        if (-not $present) {
+            if ([string]::IsNullOrEmpty($env:PATH)) {
+                $env:PATH = $dir
+            } else {
+                $env:PATH = $dir + $sep + $env:PATH
             }
         }
     }
-    return [bool](Get-Command cargo -ErrorAction SilentlyContinue)
+    return ($null -ne (Get-Command cargo -ErrorAction SilentlyContinue))
 }
 
 <#
 .SYNOPSIS
     Runs a process, streaming both stdout and stderr, with stdin closed,
     UTF-8 decoding, optional timeout, and a cancel flag. Returns ExitCode,
-    Lines (stderr then stdout), StdOut, StdErr, TimedOut and Cancelled.
+    Lines (in arrival order), StdOut, StdErr, TimedOut and Cancelled.
+    GIT_ALLOW_PROTOCOL is not set here; rtk git calls add it themselves.
 #>
 function Invoke-ToolProcess {
     param(
@@ -131,7 +209,8 @@ function Invoke-ToolProcess {
         [string]$WorkingDirectory = '',
         [scriptblock]$OnOutputLine = $null,
         [scriptblock]$OnTick = $null,
-        [int]$TimeoutSec = 0
+        [int]$TimeoutSec = 0,
+        [hashtable]$ExtraEnvironment = $null
     )
 
     if ([string]::IsNullOrWhiteSpace($FilePath)) {
@@ -163,22 +242,29 @@ function Invoke-ToolProcess {
     try {
         $psi.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
         $psi.EnvironmentVariables['GCM_INTERACTIVE'] = 'never'
-        $psi.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = 'https:ssh:git'
+        if ($null -ne $ExtraEnvironment) {
+            foreach ($k in @($ExtraEnvironment.Keys)) {
+                $psi.EnvironmentVariables[$k] = [string]$ExtraEnvironment[$k]
+            }
+        }
     } catch { $null = $_ }
 
     $process = $null
+    $lines = New-Object System.Collections.Generic.List[string]
     $stdoutLines = New-Object System.Collections.Generic.List[string]
     $stderrLines = New-Object System.Collections.Generic.List[string]
     $timedOut = $false
     $cancelled = $false
+    $callbackError = $null
     try {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $psi
         try {
             $null = $process.Start()
         } catch {
+            $msg = "could not start '${FilePath}': $($_.Exception.Message)"
             return [PSCustomObject]@{
-                ExitCode = -1; Lines = @(); StdOut = ''; StdErr = $_.Exception.Message
+                ExitCode = -1; Lines = @(); StdOut = ''; StdErr = $msg
                 TimedOut = $false; Cancelled = $false
             }
         }
@@ -188,16 +274,26 @@ function Invoke-ToolProcess {
         $errTask = $process.StandardError.ReadLineAsync()
         $deadline = $null
         if ($TimeoutSec -gt 0) { $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec) }
+        $exitedAt = $null
 
         while ($true) {
-            if ($script:BuildCancelRequested) {
+            if (Test-RcbCancelRequested) {
                 $cancelled = $true
                 Stop-ProcessTree -Process $process
                 break
             }
-            if ($null -ne $deadline -and [datetime]::UtcNow -gt $deadline) {
+            $hasExited = $false
+            try { $hasExited = $process.HasExited } catch { $hasExited = $true }
+            if ($hasExited -and $null -eq $exitedAt) { $exitedAt = [datetime]::UtcNow }
+            # A successful (or already-finished) exit must not be reported as TimedOut,
+            # even if a grandchild is still holding the pipes when the deadline hits.
+            if ($null -ne $deadline -and [datetime]::UtcNow -gt $deadline -and -not $hasExited) {
                 $timedOut = $true
                 Stop-ProcessTree -Process $process
+                break
+            }
+            if ($hasExited -and (([datetime]::UtcNow - $exitedAt).TotalMilliseconds -ge 400)) {
+                # Parent is gone: drain briefly, then stop waiting for EOF.
                 break
             }
             $wait = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task]
@@ -206,7 +302,9 @@ function Invoke-ToolProcess {
             if ($wait.Count -eq 0) { break }
             $idx = [System.Threading.Tasks.Task]::WaitAny($wait.ToArray(), 100)
             if ($idx -lt 0) {
-                if ($null -ne $OnTick) { try { & $OnTick } catch { $null = $_ } }
+                $tick = $OnTick
+                if ($null -eq $tick) { $tick = $script:RcbOnTick }
+                if ($null -ne $tick) { try { & $tick } catch { $null = $_ } }
                 continue
             }
             $done = $wait[$idx]
@@ -216,7 +314,15 @@ function Invoke-ToolProcess {
                 if ($null -eq $line) { $outTask = $null }
                 else {
                     $stdoutLines.Add($line)
-                    if ($null -ne $OnOutputLine) { try { & $OnOutputLine $line } catch { $null = $_ } }
+                    $lines.Add($line)
+                    if ($null -ne $OnOutputLine) {
+                        try { & $OnOutputLine $line } catch {
+                            $callbackError = $_
+                            $cancelled = $true
+                            Stop-ProcessTree -Process $process
+                            break
+                        }
+                    }
                     $outTask = $process.StandardOutput.ReadLineAsync()
                 }
             } elseif ($done -eq $errTask) {
@@ -225,7 +331,15 @@ function Invoke-ToolProcess {
                 if ($null -eq $line) { $errTask = $null }
                 else {
                     $stderrLines.Add($line)
-                    if ($null -ne $OnOutputLine) { try { & $OnOutputLine $line } catch { $null = $_ } }
+                    $lines.Add($line)
+                    if ($null -ne $OnOutputLine) {
+                        try { & $OnOutputLine $line } catch {
+                            $callbackError = $_
+                            $cancelled = $true
+                            Stop-ProcessTree -Process $process
+                            break
+                        }
+                    }
                     $errTask = $process.StandardError.ReadLineAsync()
                 }
             }
@@ -233,15 +347,15 @@ function Invoke-ToolProcess {
 
         if (-not $process.HasExited) { $null = $process.WaitForExit(2000) }
         if (-not $process.HasExited) { Stop-ProcessTree -Process $process; $null = $process.WaitForExit(2000) }
+        # Reap any leftover children holding the pipes.
+        try { Stop-ProcessTree -Process $process } catch { $null = $_ }
         $exit = -1
         try { if ($process.HasExited) { $exit = $process.ExitCode } } catch { $exit = -1 }
         if ($timedOut -or $cancelled) { $exit = -1 }
-        $all = New-Object System.Collections.Generic.List[string]
-        foreach ($l in $stderrLines) { $all.Add($l) }
-        foreach ($l in $stdoutLines) { $all.Add($l) }
+        if ($null -ne $callbackError) { throw $callbackError }
         return [PSCustomObject]@{
             ExitCode  = $exit
-            Lines     = $all.ToArray()
+            Lines     = $lines.ToArray()
             StdOut    = ($stdoutLines -join "`n")
             StdErr    = ($stderrLines -join "`n")
             TimedOut  = $timedOut
@@ -254,9 +368,48 @@ function Invoke-ToolProcess {
 
 <#
 .SYNOPSIS
+    The real path of a directory, following symlinks when the runtime can.
+    Used as a visited-set key so discovery can follow OneDrive / linked
+    folders without looping.
+#>
+function Get-RcbRealDirectoryPath {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) { return $Path }
+    try {
+        $info = New-Object System.IO.DirectoryInfo $Path
+        if ($info.Exists) {
+            try {
+                if ($null -ne $info.PSObject.Methods['ResolveLinkTarget']) {
+                    $resolved = $info.ResolveLinkTarget($true)
+                    if ($null -ne $resolved -and -not [string]::IsNullOrEmpty($resolved.FullName)) {
+                        return $resolved.FullName
+                    }
+                }
+            } catch { $null = $_ }
+            try {
+                if (-not [string]::IsNullOrEmpty($info.LinkTarget)) {
+                    $t = [string]$info.LinkTarget
+                    if (-not [System.IO.Path]::IsPathRooted($t)) {
+                        $parent = $info.Parent
+                        $baseDir = if ($null -ne $parent) { $parent.FullName } else { [System.IO.Path]::GetDirectoryName($info.FullName) }
+                        $t = [System.IO.Path]::GetFullPath((Join-Path $baseDir $t))
+                    }
+                    return $t
+                }
+            } catch { $null = $_ }
+            return $info.FullName
+        }
+    } catch { $null = $_ }
+    try { return [System.IO.Path]::GetFullPath($Path) } catch { return $Path }
+}
+
+<#
+.SYNOPSIS
     Iterative Cargo.toml discovery. Prunes target, .git, node_modules and
-    _built by directory name before descending, and skips reparse points
-    (junctions/symlinks) so a self-referencing link cannot loop.
+    _built by directory name before descending, unless that folder itself
+    contains a Cargo.toml (a member crate named "target"). Follows reparse
+    points and symlinks with a visited set of resolved paths so OneDrive
+    and linked project dirs are found, and loops cannot hang the walk.
 #>
 function Get-CargoTomlFiles {
     param(
@@ -264,23 +417,40 @@ function Get-CargoTomlFiles {
         [string[]]$SkipNames = @('target', '.git', 'node_modules', '_built')
     )
     $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $script:RcbDiscoverySkipped = New-Object System.Collections.Generic.List[string]
     if ([string]::IsNullOrWhiteSpace($RootDirectory) -or -not (Test-Path -LiteralPath $RootDirectory -PathType Container)) {
         return $files.ToArray()
     }
     $skip = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($n in $SkipNames) { [void]$skip.Add($n) }
+    $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $stack = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
-    $stack.Push((New-Object System.IO.DirectoryInfo ($RootDirectory)))
+    $rootInfo = New-Object System.IO.DirectoryInfo ($RootDirectory)
+    $stack.Push($rootInfo)
+    [void]$visited.Add((Get-RcbRealDirectoryPath $rootInfo.FullName))
     while ($stack.Count -gt 0) {
         $dir = $stack.Pop()
         try {
             foreach ($f in $dir.EnumerateFiles('Cargo.toml')) { $files.Add($f) }
             foreach ($sub in $dir.EnumerateDirectories()) {
-                if ($skip.Contains($sub.Name)) { continue }
-                if (($sub.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                if ($skip.Contains($sub.Name)) {
+                    $isTargetCrate = $false
+                    if ([string]::Equals($sub.Name, 'target', [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $crateToml = [System.IO.Path]::Combine($sub.FullName, 'Cargo.toml')
+                        try { $isTargetCrate = [System.IO.File]::Exists($crateToml) } catch { $isTargetCrate = $false }
+                    }
+                    if (-not $isTargetCrate) { continue }
+                }
+                $real = Get-RcbRealDirectoryPath $sub.FullName
+                if (-not $visited.Add($real)) {
+                    $script:RcbDiscoverySkipped.Add("loop: $($sub.FullName) -> $real")
+                    continue
+                }
                 $stack.Push($sub)
             }
-        } catch { $null = $_ }
+        } catch {
+            $script:RcbDiscoverySkipped.Add("$($dir.FullName): $($_.Exception.Message)")
+        }
     }
     return $files.ToArray()
 }
@@ -289,6 +459,7 @@ function Get-CargoTomlFiles {
 .SYNOPSIS
     Destination folder name under _built, based on the path relative to the
     scan root so two projects with the same leaf name do not collide.
+    Path separators become "--" so a_b and a/b stay distinct.
 #>
 function Get-RelativeBuiltName {
     param([string]$Root, [string]$ProjectDir)
@@ -301,7 +472,7 @@ function Get-RelativeBuiltName {
     if ($projFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
         $rel = $projFull.Substring($rootFull.Length).TrimStart('\', '/')
         if ([string]::IsNullOrEmpty($rel)) { return (Split-Path -Leaf $projFull) }
-        return ($rel -replace '[\\/]', '_')
+        return ($rel -replace '[\\/]', '--')
     }
     return (Split-Path -Leaf $ProjectDir)
 }
@@ -334,6 +505,75 @@ function Get-CargoLockPath {
         $cur = $parent
     }
     return (Join-Path $dir 'Cargo.lock')
+}
+
+<#
+.SYNOPSIS
+    target_directory from captured "cargo metadata" output lines. Cargo warnings
+    (stderr) may precede the JSON, so the last line starting with "{" is tried
+    first, then the whole text. Returns $null when not found.
+#>
+function Get-RcbMetadataTargetDir {
+    param([string[]]$Lines)
+    $obj = Get-RcbMetadataObject -Lines $Lines
+    if ($null -eq $obj) { return $null }
+    $prop = $null
+    try { $prop = $obj.PSObject.Properties['target_directory'] } catch { $prop = $null }
+    if ($null -ne $prop -and -not [string]::IsNullOrEmpty([string]$prop.Value)) {
+        return [string]$prop.Value
+    }
+    return $null
+}
+
+function Get-RcbMetadataObject {
+    param([string]$Text = '', [string[]]$Lines = @())
+    $all = @($Lines | Where-Object { $null -ne $_ })
+    if ($all.Count -eq 0 -and -not [string]::IsNullOrEmpty($Text)) {
+        $all = @($Text -split "`r?`n")
+    }
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $jsonLine = $null
+    foreach ($l in $all) {
+        if ($l -match '^\s*\{') { $jsonLine = $l }
+    }
+    if ($null -ne $jsonLine) { $candidates.Add($jsonLine) }
+    if ($all.Count -gt 0) { $candidates.Add(($all -join "`n")) }
+    if (-not [string]::IsNullOrEmpty($Text) -and $Text -ne ($all -join "`n")) { $candidates.Add($Text) }
+    foreach ($chunk in $candidates) {
+        $obj = $null
+        try { $obj = $chunk | ConvertFrom-Json } catch { $obj = $null }
+        if ($null -eq $obj) {
+            $start = $chunk.IndexOf('{')
+            $end = $chunk.LastIndexOf('}')
+            if ($start -ge 0 -and $end -gt $start) {
+                try { $obj = $chunk.Substring($start, $end - $start + 1) | ConvertFrom-Json } catch { $obj = $null }
+            }
+        }
+        if ($null -ne $obj) { return $obj }
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Binary target names (kind "bin") from a cargo metadata object.
+#>
+function Get-RcbMetadataBinNames {
+    param($Metadata)
+    $names = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Metadata) { return @() }
+    try {
+        foreach ($pkg in @($Metadata.packages)) {
+            foreach ($t in @($pkg.targets)) {
+                $kinds = @($t.kind)
+                if ($kinds -contains 'bin') {
+                    $n = [string]$t.name
+                    if (-not [string]::IsNullOrEmpty($n) -and -not $names.Contains($n)) { $names.Add($n) }
+                }
+            }
+        }
+    } catch { $null = $_ }
+    return $names.ToArray()
 }
 
 <#

@@ -41,16 +41,45 @@ param(
 
     # Open the legacy WinForms window instead of the rtk GUI.
     [Parameter()]
-    [switch]$ClassicGui
+    [switch]$ClassicGui,
+
+    # Optionally Authenticode-sign collected .exe/.dll files in _built (off by default).
+    [Parameter()]
+    [switch]$Sign,
+
+    # Certificate thumbprint in the CurrentUser or LocalMachine My store.
+    [Parameter()]
+    [string]$CertThumbprint,
+
+    # Path to a .pfx / .p12. The password is read only from RCB_SIGN_PFX_PASSWORD.
+    [Parameter()]
+    [string]$PfxPath,
+
+    # RFC 3161 timestamp URL (default http://timestamp.digicert.com).
+    [Parameter()]
+    [string]$TimestampUrl,
+
+    # Optional path to rcb.sign.json (defaults are also loaded from the project folder).
+    [Parameter()]
+    [string]$SignConfig
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Snapshot of this invocation's bound parameters (not a function's). Used by
+# the STA relaunch so -Path, -BuildProfile, -Test and the rest are forwarded.
+$script:RcbBoundParameters = @{}
+foreach ($rcbBk in @($PSBoundParameters.Keys)) {
+    $script:RcbBoundParameters[$rcbBk] = $PSBoundParameters[$rcbBk]
+}
+Remove-Variable -Name rcbBk -ErrorAction SilentlyContinue
 
 # Shared process helpers, rtk design tokens, forced rtk update check, JSON progress.
 . (Join-Path $PSScriptRoot (Join-Path 'lib' 'BuildCore.ps1'))
 . (Join-Path $PSScriptRoot (Join-Path 'lib' 'RtkTheme.ps1'))
 . (Join-Path $PSScriptRoot (Join-Path 'lib' 'RtkUpdate.ps1'))
 . (Join-Path $PSScriptRoot (Join-Path 'lib' 'RcbProgress.ps1'))
+. (Join-Path $PSScriptRoot (Join-Path 'lib' 'RcbSign.ps1'))
 Initialize-RcbTls12
 if ($JsonProgress) { $script:RcbJsonProgress = $true }
 
@@ -65,32 +94,94 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
 # -------------------------------------------------------------------------
 # Helper: STA Thread Runner (required for WinForms dialogs on pwsh Core)
 # -------------------------------------------------------------------------
-function Invoke-RcbStaRelaunch {
-    param([string[]]$Extra = @())
+function Get-RcbHostExecutable {
     $exe = $null
-    if ($PSVersionTable.PSVersion.Major -ge 6) {
-        $c = Get-Command pwsh -ErrorAction SilentlyContinue
-        if ($null -ne $c) { $exe = $c.Source }
+    try { $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { $exe = $null }
+    if (-not [string]::IsNullOrEmpty($exe)) {
+        $leaf = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+        if ($leaf -match '^(powershell|pwsh)$') { return $exe }
     }
-    if ([string]::IsNullOrEmpty($exe)) {
-        $c = Get-Command powershell -ErrorAction SilentlyContinue
-        if ($null -ne $c) { $exe = $c.Source }
-    }
-    if ([string]::IsNullOrEmpty($exe)) { throw 'Cannot relaunch: powershell is not on PATH' }
-    $argList = New-Object System.Collections.Generic.List[string]
-    foreach ($a in @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)) { $argList.Add($a) }
-    foreach ($k in @($PSBoundParameters.Keys)) {
-        $v = $PSBoundParameters[$k]
-        if ($v -is [System.Management.Automation.SwitchParameter]) {
-            if ($v.IsPresent) { $argList.Add("-$k") }
-        } else {
-            $argList.Add("-$k")
-            $argList.Add([string]$v)
+    if ($PSVersionTable.PSVersion.Major -le 5) { return 'powershell.exe' }
+    if ($script:IsWindowsOS) { return 'pwsh.exe' }
+    return 'pwsh'
+}
+
+function ConvertTo-RcbRelaunchArgument {
+    param(
+        [hashtable]$BoundParameters,
+        [string]$ScriptPath,
+        [string[]]$Extra = @(),
+        [string]$HostPath = 'powershell.exe'
+    )
+    $list = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $list.Add('-NoProfile')
+    if ($HostPath -match '\.exe$') { $list.Add('-STA') }
+    $list.Add('-File')
+    $list.Add($ScriptPath)
+    if ($null -ne $BoundParameters) {
+        foreach ($name in @($BoundParameters.Keys | Sort-Object)) {
+            $value = $BoundParameters[$name]
+            if ($null -eq $value) { continue }
+            $flag = '-' + [string]$name
+            if ($value -is [System.Management.Automation.SwitchParameter]) {
+                if ($value.IsPresent) {
+                    $list.Add($flag)
+                    [void]$seen.Add($flag)
+                }
+                continue
+            }
+            if ($value -is [bool]) {
+                if ($value) {
+                    $list.Add($flag)
+                    [void]$seen.Add($flag)
+                }
+                continue
+            }
+            $text = [string]$value
+            if ($text -eq '') { continue }
+            $list.Add($flag)
+            $list.Add($text)
+            [void]$seen.Add($flag)
         }
     }
-    foreach ($e in @($Extra)) { $argList.Add($e) }
-    $r = Invoke-ToolProcess -FilePath $exe -ArgumentList $argList.ToArray()
-    return $r.ExitCode
+    foreach ($e in @($Extra)) {
+        if ([string]::IsNullOrEmpty($e)) { continue }
+        if ($e.StartsWith('-') -and -not $seen.Add($e)) { continue }
+        $list.Add($e)
+    }
+    return $list.ToArray()
+}
+
+function Invoke-RcbStaRelaunch {
+    param(
+        [hashtable]$BoundParameters = $script:RcbBoundParameters,
+        [string]$ScriptPath = $PSCommandPath,
+        [string[]]$Extra = @()
+    )
+    if ($env:RCB_STA_CHILD -eq '1') {
+        throw "An STA thread is required for the window, and the relaunched process is still not STA."
+    }
+    if ([string]::IsNullOrEmpty($ScriptPath)) {
+        throw "An STA thread is required for the window, and the script path for a relaunch is unknown."
+    }
+    $hostExe = Get-RcbHostExecutable
+    $argList = @(ConvertTo-RcbRelaunchArgument -BoundParameters $BoundParameters -ScriptPath $ScriptPath -Extra $Extra -HostPath $hostExe)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $hostExe
+    $null = Set-RcbProcessArgument -StartInfo $psi -ArgumentList $argList
+    $psi.UseShellExecute = $false
+    # Inherit the console so output is not swallowed and Read-Host still works.
+    $psi.EnvironmentVariables['RCB_STA_CHILD'] = '1'
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    try {
+        [void]$proc.Start()
+        $proc.WaitForExit()
+        return [int]$proc.ExitCode
+    } finally {
+        try { $proc.Dispose() } catch { $null = $_ }
+    }
 }
 
 function Invoke-InSTA {
@@ -273,16 +364,28 @@ function Test-And-InstallPrereqs {
         } else {
             if ($script:IsWindowsOS) {
                 $tempInit = Join-Path $env:TEMP ("rustup-init-" + [guid]::NewGuid().ToString('N') + ".exe")
-                Write-BuildLog "Downloading rustup-init from https://win.rustup.rs/x86_64..." -ForegroundColor Cyan -UiCallback $UiLog
-                Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $tempInit -UseBasicParsing
-                $sig = Get-AuthenticodeSignature -FilePath $tempInit
-                if ($sig.Status -ne 'Valid') {
-                    Write-BuildLog "rustup-init Authenticode status is $($sig.Status); not running it." -ForegroundColor Red -UiCallback $UiLog
-                    return $false
-                }
-                $null = & $tempInit -y 2>&1 | ForEach-Object { Write-BuildLog "  $_" -Role muted -UiCallback $UiLog }
-                if ($LASTEXITCODE -ne 0) {
-                    Write-BuildLog "rustup-init exited $LASTEXITCODE." -ForegroundColor Red -UiCallback $UiLog
+                try {
+                    Write-BuildLog "Downloading rustup-init from https://win.rustup.rs/x86_64..." -ForegroundColor Cyan -UiCallback $UiLog
+                    Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $tempInit -UseBasicParsing
+                    $sig = Get-AuthenticodeSignature -FilePath $tempInit
+                    if ($sig.Status -ne 'Valid') {
+                        Write-BuildLog "rustup-init Authenticode status is $($sig.Status); not running it." -ForegroundColor Red -UiCallback $UiLog
+                        return $false
+                    }
+                    $subject = ''
+                    try { $subject = [string]$sig.SignerCertificate.Subject } catch { $subject = '' }
+                    if ($subject -notmatch 'Rust') {
+                        Write-BuildLog "rustup-init signer is not the Rust Foundation ($subject); not running it." -ForegroundColor Red -UiCallback $UiLog
+                        return $false
+                    }
+                    $null = & $tempInit -y 2>&1 | ForEach-Object { Write-BuildLog "  $_" -Role muted -UiCallback $UiLog }
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-BuildLog "rustup-init exited $LASTEXITCODE." -ForegroundColor Red -UiCallback $UiLog
+                    }
+                } finally {
+                    if (-not [string]::IsNullOrEmpty($tempInit) -and (Test-Path -LiteralPath $tempInit)) {
+                        try { Remove-Item -LiteralPath $tempInit -Force -ErrorAction SilentlyContinue } catch { $null = $_ }
+                    }
                 }
             } else {
                 Write-BuildLog "Please install rustup manually: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" -ForegroundColor Red -UiCallback $UiLog
@@ -326,55 +429,23 @@ function Test-And-InstallPrereqs {
 function Find-CargoProjects {
     param([string]$RootDirectory)
 
-    $allTomls = @(Get-CargoTomlFiles -RootDirectory $RootDirectory)
-    if ($allTomls.Count -eq 0) {
-        return @()
+    # Shared scanner: one walk, workspace members dropped when the root lists them,
+    # excluded / non-member packages still found as their own projects.
+    $items = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($entry in @(Get-RcbCargoManifest -RootDirectory $RootDirectory -ExcludeWorkspaceMembers)) {
+        if ($entry -is [System.IO.FileInfo]) {
+            $items.Add($entry)
+        } elseif (-not [string]::IsNullOrEmpty([string]$entry)) {
+            $items.Add((New-Object System.IO.FileInfo([string]$entry)))
+        }
     }
-
-    # The pruned walk already skipped target/.git/node_modules/_built
-    # descendants, so a root itself named "target" is still scanned (S10).
-    $validManifests = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-    foreach ($item in $allTomls) { $validManifests.Add($item) }
-
-    # Sort manifests by folder depth so top-level workspaces are evaluated first
-    $sortedManifests = $validManifests | Sort-Object { ($_.DirectoryName -split '[\\/]').Count }
-
-    $acceptedWorkspaceRoots = New-Object System.Collections.Generic.List[string]
-    $finalProjects = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-
-    foreach ($manifest in $sortedManifests) {
-        $dir = $manifest.DirectoryName
-
-        # Check if dir is under any accepted workspace root
-        $isInsideWorkspace = $false
-        foreach ($wsRoot in $acceptedWorkspaceRoots) {
-            $prefix = $wsRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
-            if ($dir.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $isInsideWorkspace = $true
-                break
-            }
+    foreach ($skip in @($script:RcbDiscoverySkipped)) {
+        if (-not [string]::IsNullOrEmpty($skip)) {
+            Write-BuildLog "  discovery skipped $skip" -Role muted
         }
-
-        if ($isInsideWorkspace) {
-            continue
-        }
-
-        # Check if this Cargo.toml declares a [workspace]
-        $content = Get-Content -LiteralPath $manifest.FullName -Raw -ErrorAction SilentlyContinue
-        $isWorkspace = $false
-        if (-not [string]::IsNullOrEmpty($content)) {
-            if ($content -match '(?m)^\s*\[workspace\]') {
-                $isWorkspace = $true
-            }
-        }
-
-        if ($isWorkspace) {
-            $acceptedWorkspaceRoots.Add($dir)
-        }
-        $finalProjects.Add($manifest)
     }
-
-    return $finalProjects.ToArray()
+    $sorted = @($items | Sort-Object { ($_.DirectoryName -split '[\\/]').Count }, FullName)
+    return [System.IO.FileInfo[]]@($sorted)
 }
 
 # -------------------------------------------------------------------------
@@ -397,7 +468,8 @@ function Invoke-CargoBuildStep {
         }
 
         $cargoExe = if (-not [string]::IsNullOrEmpty($script:ResolvedCargoPath)) { $script:ResolvedCargoPath } else { 'cargo' }
-        $procResult = Invoke-ToolProcess -FilePath $cargoExe -ArgumentList $buildArgs -WorkingDirectory $ProjectDir -OnOutputLine {
+        $timeout = $script:RcbToolTimeoutSec
+        $procResult = Invoke-ToolProcess -FilePath $cargoExe -ArgumentList $buildArgs -WorkingDirectory $ProjectDir -TimeoutSec $timeout -OnOutputLine {
             param($line)
             Write-BuildLog "  $line" -Role muted -UiCallback $UiLog
         }
@@ -453,7 +525,7 @@ function Write-SummaryTable {
         [scriptblock]$UiLog = $null
     )
     $rows = @($Results)
-    $tableText = ($rows | Format-Table -Property Project, BuildStatus, TestStatus, Artifacts, Seconds, Rtk -AutoSize -Wrap | Out-String -Width 220)
+    $tableText = ($rows | Format-Table -Property Project, BuildStatus, TestStatus, Artifacts, Seconds, Rtk, Sign -AutoSize -Wrap | Out-String -Width 220)
     $lines = @($tableText -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
     $rowIndex = -1
     foreach ($l in $lines) {
@@ -475,11 +547,13 @@ function Write-SummaryTable {
         if ($role -eq 'rtkchange') {
             $m = [regex]::Match($l, '^(.*?)(\S+)( -> )(\S+)(.*)$')
             if ($m.Success) {
-                Write-RtkSegment $m.Groups[1].Value 'success'
-                Write-RtkSegment $m.Groups[2].Value 'warning' -Bold
-                Write-RtkSegment $m.Groups[3].Value 'muted'
-                Write-RtkSegment $m.Groups[4].Value 'success' -Bold
-                Write-RtkSegment $m.Groups[5].Value 'success' -NewLine
+                if (-not $script:RcbJsonProgress) {
+                    Write-RtkSegment $m.Groups[1].Value 'success'
+                    Write-RtkSegment $m.Groups[2].Value 'warning' -Bold
+                    Write-RtkSegment $m.Groups[3].Value 'muted'
+                    Write-RtkSegment $m.Groups[4].Value 'success' -Bold
+                    Write-RtkSegment $m.Groups[5].Value 'success' -NewLine
+                }
                 Write-RcbLogLine $l
                 if ($script:RcbJsonProgress) { Write-RcbEvent 'log' ([ordered]@{ text = $l; role = 'rtkchange' }) }
                 if ($null -ne $UiLog) { try { & $UiLog $l 'rtkchange' } catch { $null = $_ } }
@@ -509,7 +583,12 @@ function Start-BuildPipeline {
         [bool]$NoOpenFlag,
         [scriptblock]$UiLog = $null,
         [scriptblock]$PromptUser = $null,
-        [bool]$NoRtkUpdateFlag = $false
+        [bool]$NoRtkUpdateFlag = $false,
+        [bool]$SignFlag = $false,
+        [string]$CertThumbprint = '',
+        [string]$PfxPath = '',
+        [string]$TimestampUrl = '',
+        [string]$SignConfigPath = ''
     )
 
     $summaryResults = New-Object System.Collections.Generic.List[PSCustomObject]
@@ -518,12 +597,20 @@ function Start-BuildPipeline {
     $script:RtkLatestCache = @{}
     $setGitCli = $false
     $cancelled = $false
+    $prevOnTick = $script:RcbOnTick
+    if ($null -ne $UiLog) {
+        $script:RcbOnTick = {
+            try { [System.Windows.Forms.Application]::DoEvents() } catch { $null = $_ }
+        }
+    }
+    if ($script:RcbJsonProgress) { Start-RcbStdinWatcher }
 
     try {
         # Check folder validity
         if ([string]::IsNullOrEmpty($TargetFolder) -or -not (Test-Path -LiteralPath $TargetFolder -PathType Container)) {
             Write-BuildLog "Error: Invalid or non-existent folder specified: '$TargetFolder'" -ForegroundColor Red -UiCallback $UiLog
-            return [PSCustomObject]@{ Success = $false; Cancelled = $true; Results = $summaryResults }
+            Write-RcbEvent 'summary' ([ordered]@{ success = $false; cancelled = $false; invalid = $true; exit_code = 2; built_dir = $null; log_file = $null; passed = 0; failed = 0 })
+            return [PSCustomObject]@{ Success = $false; Cancelled = $false; Invalid = $true; Results = $summaryResults }
         }
 
         $resolvedPath = (Resolve-Path -LiteralPath $TargetFolder).ProviderPath
@@ -546,7 +633,19 @@ function Start-BuildPipeline {
         [System.IO.File]::WriteAllText($script:LogFilePath, "Build started: $(Get-Date)`r`nPath: $resolvedPath`r`nProfile: $ActiveProfile`r`n`r`n")
         Open-RcbLogWriter -Path $script:LogFilePath
         $script:RcbBuiltDir = $builtDir
-        Write-RcbEvent 'start' ([ordered]@{ version = 1; path = $resolvedPath; profile = $ActiveProfile; test = $RunTests; rtk_update = (-not $NoRtkUpdateFlag); log_file = $script:LogFilePath })
+        $signSettings = Get-RcbSignSettings -SignFlag $SignFlag -CertThumbprint $CertThumbprint -PfxPath $PfxPath -TimestampUrl $TimestampUrl -SignConfigPath $SignConfigPath -ProjectFolder $resolvedPath -ToolRoot $PSScriptRoot
+        if ($signSettings.Enabled) {
+            $tool = Find-RcbSignTool
+            if ($null -eq $tool) {
+                $signSettings.Error = 'signtool.exe was not found (install the Windows SDK) and osslsigncode is not on PATH'
+                Write-BuildLog "sign: $($signSettings.Error). Builds will still be collected; artifacts will be marked SIGN FAILED." -Role danger -UiCallback $UiLog
+            } else {
+                $signSettings.Tool = $tool.Path
+                $signSettings.ToolKind = $tool.Kind
+                Write-BuildLog "sign: using $($tool.Kind) at $($tool.Path)" -Role muted -UiCallback $UiLog
+            }
+        }
+        Write-RcbEvent 'start' ([ordered]@{ version = 1; path = $resolvedPath; profile = $ActiveProfile; test = $RunTests; rtk_update = (-not $NoRtkUpdateFlag); sign = [bool]$signSettings.Enabled; log_file = $script:LogFilePath })
 
         Write-BuildLog "==========================================================" -ForegroundColor Cyan -UiCallback $UiLog
         Write-BuildLog " Rust Project Builder: $resolvedPath" -ForegroundColor Cyan -UiCallback $UiLog
@@ -577,7 +676,8 @@ function Start-BuildPipeline {
 
         if ($projects.Count -eq 0) {
             Write-BuildLog "No Cargo.toml manifests found in '$resolvedPath'. Pick the folder that contains your Rust project (the one with Cargo.toml)." -ForegroundColor Yellow -UiCallback $UiLog
-            return [PSCustomObject]@{ Success = $false; Cancelled = $true; Results = $summaryResults }
+            Write-RcbEvent 'summary' ([ordered]@{ success = $false; cancelled = $false; invalid = $false; exit_code = 2; built_dir = $script:RcbBuiltDir; log_file = $script:LogFilePath; passed = 0; failed = 0 })
+            return [PSCustomObject]@{ Success = $false; Cancelled = $false; Invalid = $false; Results = $summaryResults }
         }
 
         Write-BuildLog "Discovered $($projects.Count) project(s)/workspace(s).`n" -ForegroundColor Green -UiCallback $UiLog
@@ -603,18 +703,19 @@ function Start-BuildPipeline {
             $firstErrors = New-Object System.Collections.Generic.List[string]
             $firstHints  = New-Object System.Collections.Generic.List[string]
 
-            # Determine target directory via cargo metadata
+            # Determine target directory and bin names via cargo metadata
             $targetDir = $null
+            $binNames = @()
             try {
                 $metaArgs = @("metadata", "--format-version", "1", "--no-deps", "--manifest-path", $projManifestPath)
                 $cargoExe = if (-not [string]::IsNullOrEmpty($script:ResolvedCargoPath)) { $script:ResolvedCargoPath } else { 'cargo' }
-                $metaProc = Invoke-ToolProcess -FilePath $cargoExe -ArgumentList $metaArgs -WorkingDirectory $projDir
-                if ($metaProc.ExitCode -eq 0) {
-                    $jsonText = $metaProc.StdOut
-                    $metaObj = $jsonText | ConvertFrom-Json
-                    if ($null -ne $metaObj.target_directory) {
-                        $targetDir = $metaObj.target_directory
-                    }
+                $metaTimeout = $script:RcbToolTimeoutSec
+                $metaProc = Invoke-ToolProcess -FilePath $cargoExe -ArgumentList $metaArgs -WorkingDirectory $projDir -TimeoutSec $metaTimeout
+                $metaObj = Get-RcbMetadataObject -Text $metaProc.StdOut -Lines $metaProc.Lines
+                if ($null -eq $metaObj) { $targetDir = Get-RcbMetadataTargetDir -Lines $metaProc.Lines }
+                else {
+                    if ($null -ne $metaObj.target_directory) { $targetDir = $metaObj.target_directory }
+                    $binNames = @(Get-RcbMetadataBinNames -Metadata $metaObj)
                 }
             } catch {
                 # Fallback on target directory error
@@ -646,6 +747,17 @@ function Start-BuildPipeline {
                 }
             }
             Write-RcbEvent 'rtk' ([ordered]@{ index = $projIndex; name = $projName; status = [string]$rtkStatus; changed = [bool]($null -ne $rtkRes -and $rtkRes.Changed) })
+            if (Test-RcbCancelRequested) {
+                if ($null -ne $rtkRes -and $rtkRes.Changed) {
+                    $restoreFails = @(Restore-RtkBackup -Pairs $rtkRes.Backup)
+                    if ($restoreFails.Count -gt 0) { $rtkStatus = 'ROLLBACK INCOMPLETE' }
+                    else { $rtkStatus = 'cancelled; pins restored' }
+                    Write-BuildLog "  rtk: $rtkStatus" -Role warning -UiCallback $UiLog
+                }
+                $cancelled = $true
+                $overallSuccess = $false
+                break
+            }
             Write-RcbEvent 'phase' ([ordered]@{ index = $projIndex; name = $projName; phase = 'build' })
 
             # Build Step
@@ -671,6 +783,10 @@ function Start-BuildPipeline {
                 } elseif ($envHint) {
                     $rtkStatus = "build failed with an environment error; pins restored (rtk update not blamed)"
                     Write-BuildLog "  rtk: $rtkStatus" -Role warning -UiCallback $UiLog
+                } elseif (Test-RcbCancelRequested) {
+                    $rtkStatus = 'cancelled; pins restored'
+                    $cancelled = $true
+                    Write-BuildLog "  rtk: $rtkStatus" -Role warning -UiCallback $UiLog
                 } else {
                     Write-BuildLog "  rtk: rebuilding on $($rtkRes.KeptLabel)..." -Role danger -UiCallback $UiLog
                     $firstErrors.Clear(); $firstHints.Clear()
@@ -688,6 +804,7 @@ function Start-BuildPipeline {
                 }
             }
             if (-not $buildPassed) { $overallSuccess = $false }
+            if (Test-RcbCancelRequested) { $cancelled = $true; $overallSuccess = $false }
 
             # Test Step (optional)
             if ($buildPassed -and $RunTests) {
@@ -699,7 +816,7 @@ function Start-BuildPipeline {
                         $testArgs += "--release"
                     }
                     $cargoExe = if (-not [string]::IsNullOrEmpty($script:ResolvedCargoPath)) { $script:ResolvedCargoPath } else { 'cargo' }
-                    $testProc = Invoke-ToolProcess -FilePath $cargoExe -ArgumentList $testArgs -WorkingDirectory $projDir -OnOutputLine {
+                    $testProc = Invoke-ToolProcess -FilePath $cargoExe -ArgumentList $testArgs -WorkingDirectory $projDir -TimeoutSec $script:RcbToolTimeoutSec -OnOutputLine {
                         param($line)
                         Write-BuildLog "  [test] $line" -ForegroundColor Gray -UiCallback $UiLog
                     }
@@ -724,25 +841,28 @@ function Start-BuildPipeline {
                     if (-not (Test-Path -LiteralPath $destProjBuilt)) {
                         [System.IO.Directory]::CreateDirectory($destProjBuilt) | Out-Null
                     }
-                    $cutoff = $projStartedUtc.AddSeconds(-2)
+                    $wanted = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                    foreach ($n in @($binNames)) { if (-not [string]::IsNullOrEmpty($n)) { [void]$wanted.Add($n) } }
 
-                    if ($script:IsWindowsOS) {
-                        $exeFiles = Get-ChildItem -LiteralPath $outputDir -Filter "*.exe" -File -Force -ErrorAction SilentlyContinue
-                        foreach ($exe in $exeFiles) {
-                            if ($exe.LastWriteTimeUtc -lt $cutoff) { continue }
-                            $targetPath = Join-Path $destProjBuilt $exe.Name
-                            Copy-Item -LiteralPath $exe.FullName -Destination $targetPath -Force
-                            $exeCount++
+                    $allCandidates = @(Get-ChildItem -LiteralPath $outputDir -File -Force -ErrorAction SilentlyContinue)
+                    foreach ($cand in $allCandidates) {
+                        $stem = [System.IO.Path]::GetFileNameWithoutExtension($cand.Name)
+                        $ext = ([string]$cand.Extension).ToLowerInvariant()
+                        $isPe = ($ext -eq '.exe' -or $ext -eq '.dll')
+                        $isWinExe = $script:IsWindowsOS -and $ext -eq '.exe'
+                        $isUnixBin = (-not $script:IsWindowsOS) -and [string]::IsNullOrEmpty($ext) -and $cand.Name -notmatch '\.'
+                        if (-not ($isWinExe -or $isUnixBin -or $isPe)) { continue }
+                        $match = $false
+                        if ($wanted.Count -gt 0) {
+                            if ($wanted.Contains($stem) -or $wanted.Contains($cand.Name)) { $match = $true }
+                        } else {
+                            # metadata had no bin names: copy every exe-like file in the profile dir
+                            $match = $true
                         }
-                    } else {
-                        $allCandidates = Get-ChildItem -LiteralPath $outputDir -File -Force -ErrorAction SilentlyContinue
-                        foreach ($cand in $allCandidates) {
-                            if ([string]::IsNullOrEmpty($cand.Extension) -and $cand.Name -notmatch '\.' -and $cand.LastWriteTimeUtc -ge $cutoff) {
-                                $targetPath = Join-Path $destProjBuilt $cand.Name
-                                Copy-Item -LiteralPath $cand.FullName -Destination $targetPath -Force
-                                $exeCount++
-                            }
-                        }
+                        if (-not $match) { continue }
+                        $targetPath = Join-Path $destProjBuilt $cand.Name
+                        Copy-Item -LiteralPath $cand.FullName -Destination $targetPath -Force
+                        $exeCount++
                     }
                 } catch {
                     Write-BuildLog "Warning: Error copying binaries: $($_.Exception.Message)" -ForegroundColor Yellow -UiCallback $UiLog
@@ -782,6 +902,31 @@ function Start-BuildPipeline {
                 }
             }
 
+            $signStatus = 'skipped'
+            $signResults = @()
+            if ($buildPassed -and $signSettings.Enabled) {
+                Write-RcbEvent 'phase' ([ordered]@{ index = $projIndex; name = $projName; phase = 'sign' })
+                if (-not [string]::IsNullOrEmpty($signSettings.Error) -and [string]::IsNullOrEmpty($signSettings.Tool)) {
+                    $signStatus = 'SIGN FAILED'
+                    Write-BuildLog "  sign: $($signSettings.Error)" -Role danger -UiCallback $UiLog
+                    Write-RcbEvent 'sign' ([ordered]@{ index = $projIndex; name = $projName; file = ''; status = 'SIGN FAILED'; error = [string]$signSettings.Error })
+                } else {
+                    $destProjBuilt = Join-Path $builtDir $builtName
+                    $signResults = @(Invoke-RcbSignBuiltFolder -Folder $destProjBuilt -Settings $signSettings -Log {
+                        param($m, $r)
+                        Write-BuildLog $m -Role $r -UiCallback $UiLog
+                    } -OnFile {
+                        param($one)
+                        Write-RcbEvent 'sign' ([ordered]@{
+                            index = $projIndex; name = $projName
+                            file = [string]$one.File; status = [string]$one.Status; error = [string]$one.Error
+                        })
+                    })
+                    $signStatus = Get-RcbSignSummary -Results $signResults
+                    if ($signResults.Count -eq 0) { $signStatus = 'skipped' }
+                }
+            }
+
             $buildEvt = if ($buildPassed) { "PASS" } else { "FAIL" }
             $summaryResults.Add([PSCustomObject]@{
                 Project     = $projName
@@ -790,11 +935,13 @@ function Start-BuildPipeline {
                 Artifacts   = $exeCount
                 Seconds     = $elapsedSec
                 Rtk         = $rtkStatus
+                Sign        = $signStatus
                 RtkErrors   = $rtkErrors
             })
             Write-RcbEvent 'project_end' ([ordered]@{
                 index = $projIndex; name = $projName; build = $buildEvt; test = $testDisplay
                 artifacts = $exeCount; seconds = $elapsedSec; rtk = [string]$rtkStatus
+                sign = [string]$signStatus
                 errors = [string[]]$firstErrors.ToArray(); hints = [string[]]$firstHints.ToArray()
             })
 
@@ -832,6 +979,7 @@ function Start-BuildPipeline {
         if ($setGitCli) {
             Remove-Item Env:\CARGO_NET_GIT_FETCH_WITH_CLI -ErrorAction SilentlyContinue
         }
+        $script:RcbOnTick = $prevOnTick
         Close-RcbLogWriter
     }
 }
@@ -1347,7 +1495,8 @@ function Show-BuildGui {
                 -NoOpenFlag $script:ClassicNoOpen `
                 -UiLog $uiLogger `
                 -PromptUser $guiPrompt `
-                -NoRtkUpdateFlag (-not $chkRtk.Checked)
+                -NoRtkUpdateFlag (-not $chkRtk.Checked) `
+                -SignFlag $Sign.IsPresent -CertThumbprint $CertThumbprint -PfxPath $PfxPath -TimestampUrl $TimestampUrl -SignConfigPath $SignConfig
             if ($null -ne $pipeResult) {
                 $res = @($pipeResult.Results)
                 $ok = @($res | Where-Object { $_.BuildStatus -eq 'PASS' }).Count
@@ -1395,7 +1544,12 @@ function Request-FolderDialog {
 # Entry Point & Main Execution Block
 # -------------------------------------------------------------------------
 # Tests dot-source this file to load the functions without running a build.
-if ($MyInvocation.InvocationName -eq '.' -or $env:RCB_NO_MAIN -eq '1') { return }
+# Dot-sourced (or RCB_NO_MAIN) skips the entry point. A process started with
+# -File is a real run even if a parent test leaked RCB_NO_MAIN into the environment.
+$script:RcbDotSourced = ($MyInvocation.InvocationName -eq '.')
+if ($script:RcbDotSourced -or ($env:RCB_NO_MAIN -eq '1' -and $MyInvocation.InvocationName -eq '.')) { return }
+if ($env:RCB_NO_MAIN -eq '1' -and $MyInvocation.MyCommand.CommandType -ne 'ExternalScript') { return }
+
 
 $scriptExitCode = 0
 
@@ -1409,9 +1563,15 @@ try {
             $guiReason = 'no rcb-gui executable found'
             $guiHasCargo = [bool](Add-CargoBinToPath)
             if ($guiHasCargo -and (Test-Path -LiteralPath (Join-Path $guiDir 'Cargo.toml'))) {
-                # Building through this pipeline also auto-bumps the GUI's rtk git tag.
-                $guiBuild = Start-BuildPipeline -TargetFolder $guiDir -ActiveProfile 'release' -RunTests $false -NoInstallFlag $NoInstall.IsPresent -NoOpenFlag $true -NoRtkUpdateFlag $NoRtkUpdate.IsPresent
-                if ($null -eq $guiBuild -or -not $guiBuild.Success) { $guiReason = 'the GUI build failed and no earlier rcb-gui build exists' }
+                # Cargo only -- never run the rtk auto-bump against this tool's own
+                # gui/Cargo.toml (that would rewrite a tracked pin and hit the network).
+                $cargoExe = Resolve-CommandPath -Name 'cargo'
+                $guiManifest = Join-Path $guiDir 'Cargo.toml'
+                $guiCargo = Invoke-ToolProcess -FilePath $cargoExe -ArgumentList @('build', '--release', '--manifest-path', $guiManifest) -WorkingDirectory $guiDir -TimeoutSec $script:RcbToolTimeoutSec -OnOutputLine {
+                    param($line)
+                    Write-Host $line
+                }
+                if ($guiCargo.ExitCode -ne 0) { $guiReason = 'the GUI build failed and no earlier rcb-gui build exists' }
             } else {
                 $guiReason = 'cargo or gui\Cargo.toml is missing and there is no prebuilt rcb-gui'
             }
@@ -1433,6 +1593,11 @@ try {
                 if (-not [string]::IsNullOrEmpty($Path)) { $guiArgs += @('--path', $Path) }
                 if ($Test) { $guiArgs += '--test' }
                 if ($NoRtkUpdate) { $guiArgs += '--no-rtk-update' }
+                if ($Sign) { $guiArgs += '--sign' }
+                if (-not [string]::IsNullOrEmpty($CertThumbprint)) { $guiArgs += @('--cert-thumbprint', $CertThumbprint) }
+                if (-not [string]::IsNullOrEmpty($PfxPath)) { $guiArgs += @('--pfx-path', $PfxPath) }
+                if (-not [string]::IsNullOrEmpty($TimestampUrl)) { $guiArgs += @('--timestamp-url', $TimestampUrl) }
+                if (-not [string]::IsNullOrEmpty($SignConfig)) { $guiArgs += @('--sign-config', $SignConfig) }
                 try {
                     Start-Process -FilePath $guiExe -ArgumentList (Join-RcbCommandLine $guiArgs)
                     $scriptExitCode = 0
@@ -1496,11 +1661,12 @@ try {
         -RunTests $Test.IsPresent `
         -NoInstallFlag $NoInstall.IsPresent `
         -NoOpenFlag $NoOpen.IsPresent `
-        -NoRtkUpdateFlag $NoRtkUpdate.IsPresent
+        -NoRtkUpdateFlag $NoRtkUpdate.IsPresent `
+        -SignFlag $Sign.IsPresent -CertThumbprint $CertThumbprint -PfxPath $PfxPath -TimestampUrl $TimestampUrl -SignConfigPath $SignConfig
 
     if ($null -eq $pipelineResult) {
         $scriptExitCode = 1
-    } elseif ($pipelineResult.Cancelled) {
+    } elseif ($pipelineResult.Cancelled -or [bool]$pipelineResult.Invalid) {
         $scriptExitCode = 2
     } elseif ($pipelineResult.Success) {
         $scriptExitCode = 0
@@ -1527,5 +1693,12 @@ try {
         } catch { $null = $_ }
     }
 
+    # A stdin-watcher runspace blocked on [Console]::In.ReadLine() keeps
+    # PowerShell's `exit` from finishing while the GUI still holds the write
+    # end of stdin. Closing the reader here would deadlock with that
+    # ReadLine. Environment.Exit tears the process down immediately.
+    if ($script:RcbJsonProgress -or $JsonProgress) {
+        [Environment]::Exit($scriptExitCode)
+    }
     exit $scriptExitCode
 }

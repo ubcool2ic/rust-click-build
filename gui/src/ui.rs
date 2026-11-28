@@ -85,6 +85,14 @@ pub struct Ui {
     pub rtk_var: Var<bool>,
     /// "Check for rtk updates" switch.
     pub rtk_switch: WidgetId,
+    /// "Sign output" variable.
+    pub sign_var: Var<bool>,
+    /// "Sign output" switch.
+    pub sign_switch: WidgetId,
+    /// Certificate thumbprint entry.
+    pub thumb_entry: WidgetId,
+    /// PFX path entry.
+    pub pfx_entry: WidgetId,
     /// Start button.
     pub start_btn: WidgetId,
     /// Cancel button.
@@ -290,15 +298,44 @@ pub fn build(tk: &mut Tk, theme_choice: ThemeChoice) -> Result<Ui, RtkError> {
         rtk_var,
     )?;
     grid_row!(tk, rtk_switch, 3, Sticky::W, SP_4);
+    let sign_var = tk.bool_var(false);
+    let sign_switch = Switch::new(tk, options_in, "Sign output", sign_var)?;
+    grid_row!(tk, sign_switch, 4, Sticky::W, SP_4);
+    let thumb_row = plain_frame(tk, options_in)?;
+    grid_row!(tk, thumb_row, 5, Sticky::EW, SP_4);
+    let thumb_label = styled_label(tk, thumb_row, "Thumbprint", "Muted")?;
+    pack(tk, thumb_label, Side::Left, Fill::None, false, 0.0, 0.0);
+    let thumb_entry = Entry::new(tk, thumb_row)?;
+    pack(tk, thumb_entry, Side::Left, Fill::X, true, SP_8, 0.0);
+    tk.a11y_set_label(thumb_entry, "Certificate thumbprint");
+    tk.tooltip(thumb_entry, "CurrentUser or LocalMachine My store thumbprint");
+    let pfx_row = plain_frame(tk, options_in)?;
+    grid_row!(tk, pfx_row, 6, Sticky::EW, SP_4);
+    let pfx_label = styled_label(tk, pfx_row, "PFX path", "Muted")?;
+    pack(tk, pfx_label, Side::Left, Fill::None, false, 0.0, 0.0);
+    let pfx_entry = Entry::new(tk, pfx_row)?;
+    pack(tk, pfx_entry, Side::Left, Fill::X, true, SP_8, 0.0);
+    tk.a11y_set_label(pfx_entry, "PFX path");
+    tk.tooltip(
+        pfx_entry,
+        "Password comes from env RCB_SIGN_PFX_PASSWORD and is never stored",
+    );
+    let sign_hint = styled_label(
+        tk,
+        options_in,
+        "Password: env RCB_SIGN_PFX_PASSWORD (never stored).",
+        "Muted",
+    )?;
+    grid_row!(tk, sign_hint, 7, Sticky::W, SP_4);
     let spacer = plain_frame(tk, options_in)?;
-    grid_row!(tk, spacer, 4, Sticky::W, 0.0);
-    tk.grid_rowconfigure(options_in, 4, 1);
+    grid_row!(tk, spacer, 8, Sticky::W, 0.0);
+    tk.grid_rowconfigure(options_in, 8, 1);
     let start_btn = styled_button(tk, options_in, START_TEXT, Some("Accent.TButton"))?;
-    grid_row!(tk, start_btn, 5, Sticky::EW, SP_8);
+    grid_row!(tk, start_btn, 9, Sticky::EW, SP_8);
     let cancel_btn = styled_button(tk, options_in, "Cancel", None)?;
-    grid_row!(tk, cancel_btn, 6, Sticky::EW, SP_4);
+    grid_row!(tk, cancel_btn, 10, Sticky::EW, SP_4);
     let open_btn = styled_button(tk, options_in, "Open output folder", Some("Ghost.TButton"))?;
-    grid_row!(tk, open_btn, 7, Sticky::EW, SP_4);
+    grid_row!(tk, open_btn, 11, Sticky::EW, SP_4);
     tk.tooltip(start_btn, "Ctrl+Enter or F5");
     tk.tooltip(cancel_btn, "Esc");
 
@@ -338,11 +375,11 @@ pub fn build(tk: &mut Tk, theme_choice: ThemeChoice) -> Result<Ui, RtkError> {
     let table = Table::new(
         tk,
         results_in,
-        &["Project", "Build", "Tests", "rtk", "Time", "Artifacts"],
+        &["Project", "Build", "Tests", "rtk", "Time", "Artifacts", "Sign"],
         5,
     )?;
     let table_w = content_w - 4.0;
-    for (col, share) in [0.29_f32, 0.15, 0.12, 0.22, 0.10, 0.12]
+    for (col, share) in [0.22_f32, 0.12, 0.10, 0.16, 0.08, 0.12, 0.20]
         .into_iter()
         .enumerate()
     {
@@ -388,6 +425,10 @@ pub fn build(tk: &mut Tk, theme_choice: ThemeChoice) -> Result<Ui, RtkError> {
         test_switch,
         rtk_var,
         rtk_switch,
+        sign_var,
+        sign_switch,
+        thumb_entry,
+        pfx_entry,
         start_btn,
         cancel_btn,
         open_btn,
@@ -608,6 +649,9 @@ pub fn render(tk: &mut Tk, ui: &Ui, state: &BuildState) {
             ui.radio_debug,
             ui.test_switch,
             ui.rtk_switch,
+            ui.sign_switch,
+            ui.thumb_entry,
+            ui.pfx_entry,
         ] {
             tk.config(id, Opt::Disabled(running));
         }

@@ -99,6 +99,48 @@ function Write-RcbLogLine {
     line; yes/y = yes, anything else or EOF = no), Read-Host when interactive,
     otherwise $false. Never blocks on a redirected or non-interactive stdin.
 #>
+function Start-RcbStdinWatcher {
+    if (-not $script:RcbJsonProgress) { return }
+    if ($null -ne $script:RcbStdinWatchStarted -and $script:RcbStdinWatchStarted) { return }
+    $script:RcbCancelBox = [hashtable]::Synchronized(@{ Value = $false })
+    $script:RcbStdinQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+    $box = $script:RcbCancelBox
+    $queue = $script:RcbStdinQueue
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $runspace.Open()
+    $runspace.SessionStateProxy.SetVariable('RcbCancelBox', $box)
+    $runspace.SessionStateProxy.SetVariable('RcbStdinQueue', $queue)
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $runspace
+    $null = $ps.AddScript({
+        try {
+            while ($true) {
+                $line = $null
+                try { $line = [Console]::In.ReadLine() } catch { break }
+                if ($null -eq $line) { break }
+                $trim = $line.Trim()
+                if ($trim -eq 'cancel') { $RcbCancelBox['Value'] = $true }
+                else { [void]$RcbStdinQueue.Enqueue($line) }
+            }
+        } catch { $null = $_ }
+    })
+    $script:RcbStdinWatchHandle = $ps.BeginInvoke()
+    $script:RcbStdinWatchPS = $ps
+    $script:RcbStdinWatchRunspace = $runspace
+    $script:RcbStdinWatchStarted = $true
+}
+
+function Stop-RcbStdinWatcher {
+    if ($null -eq $script:RcbStdinWatchStarted -or -not $script:RcbStdinWatchStarted) { return }
+    # Closing this process's stdin unblocks ReadLine in the watcher. Do not
+    # call Runspace.Close or PowerShell.Stop: both can wait on that ReadLine
+    # and hang the script before [Environment]::Exit can run.
+    try {
+        if ([Console]::IsInputRedirected) { [Console]::In.Close() }
+    } catch { $null = $_ }
+    $script:RcbStdinWatchStarted = $false
+}
+
 function Request-RcbConfirm {
     param([string]$Id, [string]$Question, [scriptblock]$PromptUser = $null)
     if ($null -ne $PromptUser) {
@@ -108,7 +150,17 @@ function Request-RcbConfirm {
     if ($script:RcbJsonProgress) {
         Write-RcbEvent 'prompt' ([ordered]@{ id = $Id; question = $Question })
         $ans = $null
-        try { $ans = [Console]::In.ReadLine() } catch { $ans = $null }
+        if ($null -ne $script:RcbStdinQueue) {
+            $deadline = [datetime]::UtcNow.AddHours(1)
+            while ([datetime]::UtcNow -lt $deadline) {
+                if ($null -ne $script:RcbCancelBox -and [bool]$script:RcbCancelBox['Value']) { return $false }
+                $got = $null
+                if ($script:RcbStdinQueue.TryDequeue([ref]$got)) { $ans = $got; break }
+                Start-Sleep -Milliseconds 50
+            }
+        } else {
+            try { $ans = [Console]::In.ReadLine() } catch { $ans = $null }
+        }
         if ($null -eq $ans) { return $false }
         return ($ans.Trim() -match '^(y|yes)$')
     }

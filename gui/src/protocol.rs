@@ -64,6 +64,8 @@ pub enum Event {
         test: bool,
         /// rtk update check enabled.
         rtk_update: bool,
+        /// Authenticode signing enabled.
+        sign: bool,
         /// Log file path.
         log_file: String,
     },
@@ -112,6 +114,19 @@ pub enum Event {
         /// Whether the dependency was changed.
         changed: bool,
     },
+    /// Authenticode result for one collected file.
+    Sign {
+        /// 1-based index.
+        index: u64,
+        /// Project name.
+        name: String,
+        /// Artifact path.
+        file: String,
+        /// `signed` or `SIGN FAILED`.
+        status: String,
+        /// Error text when signing failed.
+        error: String,
+    },
     /// A project finished.
     ProjectEnd {
         /// 1-based index.
@@ -128,6 +143,8 @@ pub enum Event {
         seconds: f64,
         /// rtk status text.
         rtk: String,
+        /// Signing summary (`signed`, `SIGN FAILED`, `skipped`, or empty).
+        sign: String,
         /// Error lines.
         errors: Vec<String>,
         /// Hint lines.
@@ -248,6 +265,7 @@ pub fn parse_line(raw: &str) -> Line {
             profile: s(v, "profile"),
             test: b(v, "test"),
             rtk_update: b(v, "rtk_update"),
+            sign: b(v, "sign"),
             log_file: s(v, "log_file"),
         },
         "log" => Event::Log {
@@ -275,6 +293,13 @@ pub fn parse_line(raw: &str) -> Line {
             status: s(v, "status"),
             changed: b(v, "changed"),
         },
+        "sign" => Event::Sign {
+            index: n(v, "index"),
+            name: s(v, "name"),
+            file: s(v, "file"),
+            status: s(v, "status"),
+            error: s(v, "error"),
+        },
         "project_end" => Event::ProjectEnd {
             index: n(v, "index"),
             name: s(v, "name"),
@@ -283,6 +308,7 @@ pub fn parse_line(raw: &str) -> Line {
             artifacts: n(v, "artifacts"),
             seconds: f(v, "seconds"),
             rtk: s(v, "rtk"),
+            sign: s(v, "sign"),
             errors: list(v, "errors"),
             hints: list(v, "hints"),
         },
@@ -334,6 +360,7 @@ mod tests {
                 profile: "release".into(),
                 test: true,
                 rtk_update: false,
+                sign: false,
                 log_file: "l.txt".into()
             }
         );
@@ -378,6 +405,16 @@ mod tests {
             }
         );
         assert_eq!(
+            ev(r#"{"event":"sign","index":1,"name":"a","file":"out.exe","status":"SIGN FAILED","error":"no cert"}"#),
+            Event::Sign {
+                index: 1,
+                name: "a".into(),
+                file: "out.exe".into(),
+                status: "SIGN FAILED".into(),
+                error: "no cert".into()
+            }
+        );
+        assert_eq!(
             ev(
                 r#"{"event":"project_end","index":1,"name":"a","build":"FAIL","test":"N/A","artifacts":0,"seconds":1.5,"rtk":"v1","errors":["e"],"hints":["h"]}"#
             ),
@@ -389,6 +426,7 @@ mod tests {
                 artifacts: 0,
                 seconds: 1.5,
                 rtk: "v1".into(),
+                sign: String::new(),
                 errors: vec!["e".into()],
                 hints: vec!["h".into()]
             }

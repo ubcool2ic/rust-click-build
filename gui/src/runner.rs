@@ -25,6 +25,10 @@ const MAX_LINE_BYTES: usize = 256 * 1024;
 /// exited. A grandchild that inherited the pipes can hold them open forever.
 const READER_GRACE: Duration = Duration::from_secs(3);
 
+/// How long cancel/close waits for build.ps1 to honor a `cancel` stdin line
+/// (and restore any rtk pin it just bumped) before the process tree is killed.
+const CANCEL_GRACE: Duration = Duration::from_secs(12);
+
 /// Cargo build profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
@@ -75,6 +79,16 @@ pub struct BuildRequest {
     pub test: bool,
     /// Check for rtk updates first.
     pub rtk_update: bool,
+    /// Authenticode-sign collected artifacts.
+    pub sign: bool,
+    /// Certificate thumbprint (CurrentUser or LocalMachine My store).
+    pub cert_thumbprint: Option<String>,
+    /// PFX path. The password is read by build.ps1 from RCB_SIGN_PFX_PASSWORD.
+    pub pfx_path: Option<PathBuf>,
+    /// RFC 3161 timestamp URL override.
+    pub timestamp_url: Option<String>,
+    /// Optional rcb.sign.json path.
+    pub sign_config: Option<PathBuf>,
 }
 
 /// A program plus its argument vector (never a single joined string).
@@ -104,6 +118,25 @@ pub fn build_args(req: &BuildRequest, kind: ShellKind) -> Vec<OsString> {
     }
     if !req.rtk_update {
         args.push("-NoRtkUpdate".into());
+    }
+    if req.sign {
+        args.push("-Sign".into());
+    }
+    if let Some(thumb) = req.cert_thumbprint.as_ref().filter(|s| !s.is_empty()) {
+        args.push("-CertThumbprint".into());
+        args.push(thumb.clone().into());
+    }
+    if let Some(pfx) = req.pfx_path.as_ref() {
+        args.push("-PfxPath".into());
+        args.push(pfx.clone().into_os_string());
+    }
+    if let Some(url) = req.timestamp_url.as_ref().filter(|s| !s.is_empty()) {
+        args.push("-TimestampUrl".into());
+        args.push(url.clone().into());
+    }
+    if let Some(cfg) = req.sign_config.as_ref() {
+        args.push("-SignConfig".into());
+        args.push(cfg.clone().into_os_string());
     }
     args.push("-NoOpen".into());
     args.push("-JsonProgress".into());
@@ -376,12 +409,32 @@ impl Runner {
         }
     }
 
-    /// Kills the child (process tree on Windows). Safe to call repeatedly.
+    /// Asks the child to stop. Writes `cancel\n` on stdin so build.ps1 can
+    /// restore an in-flight rtk bump, then hard-kills the tree if it has not
+    /// exited after [`CANCEL_GRACE`]. Safe to call repeatedly.
     pub fn cancel(&self) {
+        self.request_stop(CANCEL_GRACE);
+    }
+
+    fn request_stop(&self, grace: Duration) {
         if self.is_finished() {
             return;
         }
-        // Closing stdin unblocks a child waiting on a prompt.
+        {
+            let mut guard = lock(&self.stdin);
+            if let Some(stdin) = guard.as_mut() {
+                let _ = stdin
+                    .write_all(b"cancel\n")
+                    .and_then(|()| stdin.flush());
+            }
+        }
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline && !self.is_finished() {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if self.is_finished() {
+            return;
+        }
         *lock(&self.stdin) = None;
         kill_tree(self.pid, &self.child, false);
     }
@@ -401,10 +454,13 @@ impl Drop for Runner {
         if self.is_finished() {
             return;
         }
-        *lock(&self.stdin) = None;
-        // Synchronous: the process may exit right after this drop, which
-        // would abandon a background kill before it ran.
-        kill_tree(self.pid, &self.child, true);
+        self.request_stop(CANCEL_GRACE);
+        if !self.is_finished() {
+            *lock(&self.stdin) = None;
+            // Synchronous: the process may exit right after this drop, which
+            // would abandon a background kill before it ran.
+            kill_tree(self.pid, &self.child, true);
+        }
     }
 }
 
@@ -419,6 +475,11 @@ mod tests {
             profile: Profile::Release,
             test: true,
             rtk_update: false,
+            sign: false,
+            cert_thumbprint: None,
+            pfx_path: None,
+            timestamp_url: None,
+            sign_config: None,
         }
     }
 
@@ -475,6 +536,28 @@ mod tests {
                 "-JsonProgress",
             ]
         );
+    }
+
+    #[test]
+    fn sign_flags_are_forwarded() {
+        let mut request = req("/tmp/src");
+        request.sign = true;
+        request.cert_thumbprint = Some("DEADBEEF".into());
+        request.pfx_path = Some(PathBuf::from("/tmp/dev.pfx"));
+        request.timestamp_url = Some("http://timestamp.example".into());
+        request.sign_config = Some(PathBuf::from("/tmp/rcb.sign.json"));
+        let spec = build_command(&request, ShellKind::Unix, None);
+        let got = strs(&spec.args);
+        assert!(got.contains(&"-Sign".into()));
+        assert!(got.contains(&"-CertThumbprint".into()));
+        assert!(got.contains(&"DEADBEEF".into()));
+        assert!(got.contains(&"-PfxPath".into()));
+        assert!(got.contains(&"/tmp/dev.pfx".into()));
+        assert!(got.contains(&"-TimestampUrl".into()));
+        assert!(got.contains(&"http://timestamp.example".into()));
+        assert!(got.contains(&"-SignConfig".into()));
+        assert!(got.contains(&"/tmp/rcb.sign.json".into()));
+        assert!(!got.iter().any(|a| a.contains("RCB_SIGN_PFX_PASSWORD") || a.contains("pass")));
     }
 
     #[test]

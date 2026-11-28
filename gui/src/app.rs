@@ -26,6 +26,10 @@ struct App {
     script: Option<PathBuf>,
     /// The current child asked a question that has not been answered yet.
     prompt_pending: bool,
+    /// Optional RFC 3161 URL forwarded from the CLI (no GUI field).
+    timestamp_url: Option<String>,
+    /// Optional rcb.sign.json path forwarded from the CLI.
+    sign_config: Option<PathBuf>,
 }
 
 /// Observer of every runner message (test hook).
@@ -254,6 +258,27 @@ impl App {
             },
             test: self.ui.test_var.get(tk).unwrap_or(false),
             rtk_update: self.ui.rtk_var.get(tk).unwrap_or(true),
+            sign: self.ui.sign_var.get(tk).unwrap_or(false),
+            cert_thumbprint: {
+                let raw = tk.entry_get(self.ui.thumb_entry).unwrap_or_default();
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            },
+            pfx_path: {
+                let raw = tk.entry_get(self.ui.pfx_entry).unwrap_or_default();
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(trimmed))
+                }
+            },
+            timestamp_url: self.timestamp_url.clone(),
+            sign_config: self.sign_config.clone(),
         };
         let spec = runner::build_command_for_host(&request);
         let sink: Sink = Arc::new(|tk: &mut Tk, msg: RunnerMsg| on_runner_msg(tk, msg));
@@ -400,6 +425,15 @@ pub fn setup(tk: &mut Tk, args: &Args) -> Result<(), Box<dyn Error>> {
     if args.no_rtk_update {
         ui.rtk_var.set(tk, false);
     }
+    if args.sign {
+        ui.sign_var.set(tk, true);
+    }
+    if let Some(thumb) = &args.cert_thumbprint {
+        tk.entry_set(ui.thumb_entry, thumb.clone());
+    }
+    if let Some(pfx) = &args.pfx_path {
+        tk.entry_set(ui.pfx_entry, pfx.to_string_lossy().into_owned());
+    }
 
     let (start_btn, cancel_btn, open_btn, browse_btn, theme_var, folder_entry) = (
         ui.start_btn,
@@ -415,6 +449,8 @@ pub fn setup(tk: &mut Tk, args: &Args) -> Result<(), Box<dyn Error>> {
         runner: None,
         script: args::find_script(args.script.as_deref()),
         prompt_pending: false,
+        timestamp_url: args.timestamp_url.clone(),
+        sign_config: args.sign_config.clone(),
     };
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::new(RefCell::new(app))));
 

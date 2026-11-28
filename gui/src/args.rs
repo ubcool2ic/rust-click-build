@@ -15,6 +15,11 @@ pub const USAGE: &str = "Usage: rcb-gui [options]
   --theme <t>             System | Light | Dark | HighContrast
   --test                  Run tests after building
   --no-rtk-update         Do not check for rtk updates before building
+  --sign                  Authenticode-sign collected .exe/.dll artifacts
+  --cert-thumbprint <hex> Certificate thumbprint (CurrentUser/LocalMachine My)
+  --pfx-path <file>       Path to a .pfx / .p12 (password: RCB_SIGN_PFX_PASSWORD)
+  --timestamp-url <url>   RFC 3161 timestamp URL
+  --sign-config <file>    Path to rcb.sign.json defaults
   --screenshot-dir <dir>  Render the screenshot set headlessly and exit
   --help                  Show this help";
 
@@ -33,6 +38,16 @@ pub struct Args {
     pub test: bool,
     /// Skip the rtk update check.
     pub no_rtk_update: bool,
+    /// Authenticode-sign collected artifacts.
+    pub sign: bool,
+    /// Certificate thumbprint.
+    pub cert_thumbprint: Option<String>,
+    /// PFX / P12 path. The password is never taken from the CLI.
+    pub pfx_path: Option<PathBuf>,
+    /// RFC 3161 timestamp URL.
+    pub timestamp_url: Option<String>,
+    /// Optional rcb.sign.json path.
+    pub sign_config: Option<PathBuf>,
     /// Headless screenshot output directory.
     pub screenshot_dir: Option<PathBuf>,
     /// `--help` was given.
@@ -85,6 +100,15 @@ where
             }
             "--test" => out.test = true,
             "--no-rtk-update" => out.no_rtk_update = true,
+            "--sign" => out.sign = true,
+            "--cert-thumbprint" => {
+                out.cert_thumbprint = Some(value(&mut it, &flag)?.to_string_lossy().into_owned());
+            }
+            "--pfx-path" => out.pfx_path = Some(PathBuf::from(value(&mut it, &flag)?)),
+            "--timestamp-url" => {
+                out.timestamp_url = Some(value(&mut it, &flag)?.to_string_lossy().into_owned());
+            }
+            "--sign-config" => out.sign_config = Some(PathBuf::from(value(&mut it, &flag)?)),
             "--help" | "-h" => out.help = true,
             other => return Err(ArgsError(format!("unknown argument '{other}'"))),
         }
@@ -145,6 +169,15 @@ mod tests {
             "HIGHCONTRAST",
             "--test",
             "--no-rtk-update",
+            "--sign",
+            "--cert-thumbprint",
+            "AABBCC",
+            "--pfx-path",
+            "dev.pfx",
+            "--timestamp-url",
+            "http://timestamp.digicert.com",
+            "--sign-config",
+            "rcb.sign.json",
             "--screenshot-dir",
             "out",
         ])
@@ -155,6 +188,11 @@ mod tests {
         assert_eq!(args.theme, Some(ThemeChoice::HighContrast));
         assert!(args.test);
         assert!(args.no_rtk_update);
+        assert!(args.sign);
+        assert_eq!(args.cert_thumbprint.as_deref(), Some("AABBCC"));
+        assert_eq!(args.pfx_path, Some(PathBuf::from("dev.pfx")));
+        assert_eq!(args.timestamp_url.as_deref(), Some("http://timestamp.digicert.com"));
+        assert_eq!(args.sign_config, Some(PathBuf::from("rcb.sign.json")));
         assert_eq!(args.screenshot_dir, Some(PathBuf::from("out")));
     }
 

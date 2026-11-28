@@ -66,7 +66,7 @@ fn cancel_kills_the_tree_and_finishes_promptly() {
     });
     runner.cancel();
     runner.cancel();
-    wait_until(&mut tk, &collected, 15, |m| matches!(m, RunnerMsg::Exited(_)));
+    wait_until(&mut tk, &collected, 20, |m| matches!(m, RunnerMsg::Exited(_)));
     assert!(runner.is_finished());
     // Cancel and prompt answers after the end are harmless.
     runner.cancel();
@@ -86,6 +86,23 @@ fn exit_is_reported_even_if_a_grandchild_keeps_the_pipes_open() {
     let all = collected.lock().expect("lock").clone();
     assert_eq!(all.last(), Some(&RunnerMsg::Exited(Some(0))));
     assert!(all.contains(&RunnerMsg::Line(Line::Text("done".into()))));
+    runner.join();
+}
+
+#[test]
+fn cancel_writes_a_cancel_line_so_the_child_can_restore() {
+    let mut tk = Tk::new();
+    let (collected, sink) = collecting_sink();
+    // The child waits for a stdin line; "cancel" makes it print and exit 0.
+    let spec = sh("read line; echo got=$line; if [ \"$line\" = cancel ]; then exit 0; else sleep 30; fi");
+    let runner = Runner::spawn(&spec, tk.proxy(), sink).expect("spawn sh");
+    std::thread::sleep(Duration::from_millis(100));
+    runner.cancel();
+    wait_until(&mut tk, &collected, 8, |m| matches!(m, RunnerMsg::Exited(_)));
+    assert!(runner.is_finished());
+    let all = collected.lock().expect("lock").clone();
+    assert_eq!(all.last(), Some(&RunnerMsg::Exited(Some(0))));
+    assert!(all.iter().any(|m| matches!(m, RunnerMsg::Line(Line::Text(t)) if t == "got=cancel")));
     runner.join();
 }
 
@@ -116,6 +133,11 @@ fn delivers_events_in_order_and_answers_prompt() {
         profile: Profile::Release,
         test: false,
         rtk_update: true,
+        sign: false,
+        cert_thumbprint: None,
+        pfx_path: None,
+        timestamp_url: None,
+        sign_config: None,
     };
     let spec = runner::build_command_for_host(&request);
     assert_eq!(spec.program, script.clone().into_os_string());

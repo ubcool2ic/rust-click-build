@@ -85,8 +85,9 @@ Describe 'Get-CargoTomlFiles' {
 Describe 'Get-RelativeBuiltName and Get-CargoLockPath' {
     It 'uses a relative path so two cli projects do not collide' {
         $root = Join-Path $TestDrive 'multi'
-        Get-RelativeBuiltName -Root $root -ProjectDir (Join-Path $root 'a/cli') | Should -Be 'a_cli'
-        Get-RelativeBuiltName -Root $root -ProjectDir (Join-Path $root 'b/cli') | Should -Be 'b_cli'
+        Get-RelativeBuiltName -Root $root -ProjectDir (Join-Path $root 'a/cli') | Should -Be 'a--cli'
+        Get-RelativeBuiltName -Root $root -ProjectDir (Join-Path $root 'b/cli') | Should -Be 'b--cli'
+        Get-RelativeBuiltName -Root $root -ProjectDir (Join-Path $root 'a_cli') | Should -Be 'a_cli'
     }
     It 'backs up the workspace-root Cargo.lock for a member crate' {
         $ws = Join-Path $script:Fixtures 'workspace'
@@ -111,7 +112,7 @@ Describe 'Restore-RtkBackup and cargo-update throw' {
         $before = Get-Content -Raw (Join-Path $dir 'Cargo.toml')
         $r = Invoke-RtkUpdateCheck -ManifestPath (Join-Path $dir 'Cargo.toml') -BackupRoot (Join-Path $dir '_built')
         $r.Changed | Should -BeFalse
-        $r.Status | Should -Match 'update failed; kept old pins'
+        $r.Status | Should -Match 'cargo update -p rtk failed; kept'
         Get-Content -Raw (Join-Path $dir 'Cargo.toml') | Should -Be $before
     }
 }
@@ -208,4 +209,9 @@ esac
         $copied = @(Get-ChildItem -LiteralPath (Join-Path $dir '_built') -Recurse -File | Where-Object { $_.Name -eq 'no-rtk' })
         $copied.Count | Should -Be 1
     }
+}
+
+
+AfterAll {
+    Remove-Item Env:\RCB_NO_MAIN -ErrorAction SilentlyContinue
 }

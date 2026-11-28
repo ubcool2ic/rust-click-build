@@ -128,6 +128,8 @@ fn render_one(choice: ThemeChoice, stage: Stage, path: &Path) -> Result<usize, B
     let ui = ui::build(&mut tk, choice)?;
     tk.entry_set(ui.folder_entry, "C:\\Users\\dev\\projects\\rust-apps");
     ui.test_var.set(&mut tk, true);
+    ui.sign_var.set(&mut tk, true);
+    tk.entry_set(ui.thumb_entry, "AABBCCDDEEFF00112233445566778899AABBCCDD");
     let state = sample_state(stage);
     ui::render(&mut tk, &ui, &state);
     let pixmap = tk.render_to_pixmap(WINDOW_WIDTH, WINDOW_HEIGHT)?;

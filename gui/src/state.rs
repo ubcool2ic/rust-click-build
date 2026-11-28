@@ -66,7 +66,7 @@ pub struct ProjectRow {
     pub name: String,
     /// Lifecycle state.
     pub state: RowState,
-    /// Current phase (`rtk`, `build`, `test`, `collect`).
+    /// Current phase (`rtk`, `build`, `test`, `collect`, `sign`).
     pub phase: String,
     /// Build result (`PASS`/`FAIL`), empty until finished.
     pub build: String,
@@ -80,6 +80,8 @@ pub struct ProjectRow {
     pub seconds: Option<f64>,
     /// Number of artifacts.
     pub artifacts: Option<u64>,
+    /// Signing status (`signed`, `SIGN FAILED`, `skipped`).
+    pub sign: String,
     /// Error lines reported for the project.
     pub errors: Vec<String>,
     /// Hint lines reported for the project.
@@ -98,6 +100,7 @@ impl ProjectRow {
             rtk_changed: false,
             seconds: None,
             artifacts: None,
+            sign: String::new(),
             errors: Vec::new(),
             hints: Vec::new(),
         }
@@ -130,6 +133,7 @@ pub fn phase_label(phase: &str) -> &str {
         "build" => "building",
         "test" => "testing",
         "collect" => "collecting artifacts",
+        "sign" => "signing",
         "" => "starting",
         other => other,
     }
@@ -264,6 +268,20 @@ impl BuildState {
                     row.rtk_changed = *changed;
                 }
             }
+            Event::Sign {
+                index,
+                status,
+                error,
+                ..
+            } => {
+                if let Some(row) = self.row_mut(*index) {
+                    if status.eq_ignore_ascii_case("SIGN FAILED") || !error.is_empty() {
+                        row.sign = "SIGN FAILED".into();
+                    } else if row.sign != "SIGN FAILED" {
+                        row.sign = status.clone();
+                    }
+                }
+            }
             Event::ProjectEnd {
                 index,
                 name,
@@ -272,6 +290,7 @@ impl BuildState {
                 artifacts,
                 seconds,
                 rtk,
+                sign,
                 errors,
                 hints,
             } => {
@@ -284,6 +303,9 @@ impl BuildState {
                     row.seconds = Some(*seconds);
                     if !rtk.is_empty() {
                         row.rtk = rtk.clone();
+                    }
+                    if !sign.is_empty() {
+                        row.sign = sign.clone();
                     }
                     row.errors = errors.clone();
                     row.hints = hints.clone();
@@ -507,7 +529,7 @@ impl BuildState {
         }
     }
 
-    /// Rows for the results table: Project, Build, Tests, rtk, Time, Artifacts.
+    /// Rows for the results table: Project, Build, Tests, rtk, Time, Artifacts, Sign.
     pub fn table_rows(&self) -> Vec<Vec<String>> {
         self.rows
             .iter()
@@ -524,6 +546,7 @@ impl BuildState {
                     row.rtk.clone(),
                     row.seconds.map(|s| format!("{s:.1}s")).unwrap_or_default(),
                     row.artifacts.map(|a| a.to_string()).unwrap_or_default(),
+                    row.sign.clone(),
                 ]
             })
             .collect()
@@ -590,6 +613,7 @@ mod tests {
             artifacts: 1,
             seconds: 2.25,
             rtk: "v1.0.2".into(),
+            sign: "signed".into(),
             errors: vec![],
             hints: vec![],
         }
@@ -633,7 +657,7 @@ mod tests {
         let rows = st.table_rows();
         assert_eq!(
             rows[1],
-            vec!["p2", "FAIL", "N/A", "v1.0.2", "2.2s", "1"]
+            vec!["p2", "FAIL", "N/A", "v1.0.2", "2.2s", "1", "signed"]
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>()
